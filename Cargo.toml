@@ -1,0 +1,19 @@
+[package]
+name = "delta_trading_engine"
+version = "0.1.0"
+edition = "2021"
+default-run = "delta_trading_engine"
+
+[dependencies]
+tokio = { version = "1.37.0", features = ["full"] }
+tokio-tungstenite = { version = "0.21.0", features = ["native-tls"] }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.115"
+reqwest = { version = "0.12.3", features = ["json"] }
+hmac = "0.12.1"
+sha2 = "0.10.8"
+hex = "0.4.3"
+futures-util = "0.3.30"
+url = "2.5.0"
+dotenvy = "0.15.7"
+chrono = "0.4.38"
