@@ -1,10 +1,12 @@
+use dotenvy::dotenv;
 use hmac::{Hmac, Mac};
+use reqwest::Client;
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub fn generate_signature(
+fn generate_signature(
     api_secret: &str,
     method: &str,
     timestamp: &str,
@@ -22,7 +24,7 @@ pub fn generate_signature(
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
+    dotenv().ok();
 
     let api_key = match std::env::var("DELTA_API_KEY") {
         Ok(key) => key,
@@ -41,14 +43,13 @@ async fn main() {
 
     println!("Checking credentials against Delta Exchange GET /v2/wallet/balances...");
     println!("API Key: {}", api_key);
-    
-    let client = reqwest::Client::builder()
+
+    let client = Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .unwrap_or_else(|_| Client::new());
 
     let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
-
         Ok(n) => n.as_secs().to_string(),
         Err(e) => {
             eprintln!("Time went backwards: {:?}", e);
@@ -58,9 +59,9 @@ async fn main() {
 
     let method = "GET";
     let path = "/v2/wallet/balances";
-    let payload_str = ""; 
-    
-    let signature = generate_signature(&api_secret, method, &timestamp, path, &payload_str);
+    let payload_str = "";
+
+    let signature = generate_signature(&api_secret, method, &timestamp, path, payload_str);
     let url = format!("https://api.india.delta.exchange{}", path);
 
     let res = client

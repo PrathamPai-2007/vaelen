@@ -1,109 +1,152 @@
-# Delta Exchange Order Flow Trading Engine in Rust
+# Institutional Order Flow Trading Engine
 
-A high-performance, sub-second latency order flow trading engine written in Rust. The engine ingests live market trades via WebSockets, calculates a Cumulative Volume Delta (CVD) passive absorption indicator in a zero-allocation hot path, and manages risk-aware limit orders via Delta Exchange's authenticated REST API.
+A high-performance, low-latency institutional order flow trading engine written in Rust with a parallelized zero-copy Python research and Walk-Forward Optimization (WFO) pipeline. Designed for high-frequency cryptocurrency perpetual markets on Delta Exchange.
 
-## Core Features & Optimizations
-
-- **Zero-Allocation Runtime Hot Path**: Uses statically bounded `VecDeque` arrays capped at 500 rows to ensure no heap allocations are performed during trade telemetry ingestion and calculation, keeping CPU cache latency minimal.
-- **Asynchronous Decoupled Concurrency**: Ingestion, Strategy, and Execution layers communicate via fast, lock-free bounded `tokio::sync::mpsc` channels.
-- **Nagle's Algorithm Disabled (`TCP_NODELAY`)**: The underlying WebSocket TCP stream is configured with `disable_nagle = true`. This forces the network stack to transmit and receive WebSocket frames instantly rather than pooling them into TCP buffers, drastically reducing microsecond latency.
-- **Bullish Passive Absorption Divergence Strategy**: Continuously monitors the 50-tick lookback window for instances where the price drops but CVD grows significantly (exceeding $5.5 \times \text{trade size}$), signalling passive buyers absorbing market sell pressure.
-- **Flat-Schema WebSocket Decoding**: The engine natively deserializes Delta Exchange's ultra-compressed WebSocket payload layout (`p`, `s`, `r`, `sy`), directly matching buyer/seller roles to market ticks efficiently.
-- **Ultra-Low Latency Execution**: Optimizes the `reqwest` execution client by maintaining a persistent HTTP pool with short (30s) TCP keep-alive probes, completely bypassing DNS and TLS handshake latency to achieve WebSocket-like speeds while avoiding CloudFront WAF connection drops.
-
-## Session Management & Paper Trading
-
-- **Native Paper Trading Engine**: Includes a memory-based paper trading module (`PAPER_TRADE_MODE=true`). When activated, it intercepts buy signals and tracks the live market for exactly 50 ticks to compute absolute PnL without risking real capital.
-- **Timestamped Trade Logging**: Every session automatically generates a uniquely timestamped CSV file in the `trades/` directory (e.g., `trades/2026-07-17_23-10-46.csv`).
-- **Silent & Unblocked Terminal I/O**: High-frequency terminal prints (which block CPU threads on Windows) are aggressively silenced. Trades process silently while logging strictly to the SSD.
-- **Graceful Shutdown Summaries**: Hooks into `tokio::signal::ctrl_c` to gracefully drop channels, close WebSocket connections, and print a consolidated session PnL block summarizing entry/exit effectiveness before terminating.
+The engine implements an **Institutional Iceberg-Absorption Fade Model** based on **Volume-Weighted Price Impact**, detecting passive wall absorption in real-time, executing maker limit entries to capture fee rebates, and enforcing strict volatility-adaptive risk boundaries.
 
 ---
 
-## Architecture Diagram
+## Core System Architecture
 
 ```mermaid
 graph TD
-    A[Delta Exchange WebSocket] -->|TCP_NODELAY Stream| B(Ingestion Feed)
-    B -->|Bounded Channel| C(Strategy Engine)
-    C -->|Zero Alloc CVD Queue| D{Absorption Divergence Check}
-    D -->|Signal Triggered| E{Paper Trading Mode?}
-    E -->|Yes| F(Virtual Trade Evaluator)
-    F -->|Track 50 Ticks| G[Log to trades/YYYY-MM-DD.csv]
-    E -->|No| H(Order Manager)
-    H -->|tokio::spawn POST| I[Delta Exchange REST API]
+    A[Delta Exchange Market Feed] -->|WebSocket / TCP_NODELAY| B[Ingestion Layer]
+    B -->|tokio::sync::mpsc Bounded Channel| C[Strategy Engine]
+    C --> D[SymbolState Bounded Queues]
+    D -->|O(1) Hot Path| E{Iceberg Absorption Check}
+    
+    subgraph "Strategy Evaluation Circuit"
+        E -->|Lookback Window| F[Volume-Weighted Price Impact: |ΔP| / V_cum]
+        E -->|Block-Cached O(1)| G[95th Percentile Volume Filter]
+        E -->|USD Notional Gate| H[Institutional Volume Threshold]
+    end
+    
+    F & G & H -->|Signal Triggered| I{Paper Trade / Live Execution}
+    I -->|Paper Mode| J[Paper Trade Simulator & Session Tracker]
+    I -->|Live Mode| K[Order Manager & Lifecycle State Machine]
+    K -->|Post-Only Maker Limit| L[Delta Exchange REST API]
+    L -->|Fill Confirmed| M[Passive TP Limit + Taker SL Protection]
 ```
 
 ---
 
-## Directory Structure
+## Key Features & Micro-Structural Design
+
+- **Volume-Weighted Price Impact Model**: Detects institutional absorption by measuring price movement relative to taker volume over a sliding lookback window ($|\Delta P| / V_{cum}$). Fades massive taker volume when price fails to break support/resistance.
+- **Zero-Allocation Hot Path**: Bounded `VecDeque` ring buffers per symbol eliminate runtime heap allocations during tick processing.
+- **O(1) Block-Cached 95th Percentile Filter**: Recomputes the rolling 1,000-tick 95th percentile volume every 500 ticks (`P95_UPDATE_INTERVAL`) with immediate cold-start initialization. Removes per-tick sorting and speeds up execution by over $30\times$.
+- **Process-Isolated Zero-Copy WFO Engine**: Uses `ProcessPoolExecutor` paired with memory-mapped array slices (`np.load(..., mmap_mode="r")`) to bypass the Python GIL and scale across multi-core architectures with zero IPC data serialization overhead.
+- **Automated Codeswitch Clause**: Continuously evaluates candidate symbols against Out-of-Sample (OOS) performance constraints ($PF_{fee} \ge 1.0$, non-zero trade count). Underperforming assets trigger an emergency drop, programmatically stripping them from `config.toml` and reverting to the isolated `1000PEPEUSD` production configuration.
+- **Maker Order Execution & Timeout Protection**: Entries are posted as maker limit orders to capture maker fee rebates. Unfilled limit entries automatically time out after 5 seconds to prevent stale execution.
+- **Asynchronous Architecture**: Built on Tokio with decoupled channel communication, non-blocking HTTP order management with retry backoff, and `TCP_NODELAY` socket optimization.
+
+---
+
+## Mathematical & Algorithmic Model
+
+### 1. Cumulative Volume Delta (CVD) & Lookback Drift Prevention
+For each incoming trade tick $i$ with price $P_i$, size $S_i$, and aggressor direction $D_i \in \{+1 \text{ (buy)}, -1 \text{ (sell)}\}$:
+
+$$\text{CVD}_i = \text{CVD}_{i-1} + D_i \cdot S_i$$
+
+The rolling volume over lookback window $L$ is precisely maintained without lookback drift:
+
+$$V_{cum, i} = \sum_{k=i-L+1}^{i} S_k$$
+
+### 2. Volume-Weighted Price Impact
+$$\text{Price Impact}_i = \frac{|P_i - P_{i-L}|}{V_{cum, i}}$$
+
+An absorption event occurs when $V_{cum, i} \cdot P_i > \text{min\_cvd\_notional\_usd}$, $S_i > \text{P95}(V)$, and:
+
+$$\text{Price Impact}_i < \text{max\_price\_impact\_threshold}$$
+
+### 3. Signal Generation
+- **Short Fade**: Aggressive buying ($\text{CVD}_i > \text{CVD}_{i-L}$) but price hits a ceiling ($\Delta P_i \le 0$).
+- **Long Fade**: Aggressive selling ($\text{CVD}_i < \text{CVD}_{i-L}$) but price hits a floor ($\Delta P_i \ge 0$).
+
+---
+
+## Repository Structure
 
 ```text
-├── Cargo.toml
-├── README.md
-├── .env
-├── .gitignore
-├── trades/             # Auto-generated directory for session PnL CSV logs
-└── src/
-    ├── main.rs         # Live trading engine (ingestion, strategy, execution, and graceful shutdown)
-    └── bin/
-        └── verify.rs   # Key verification utility
+.
+├── Cargo.toml                  # Rust project manifest
+├── config.toml                 # Production engine & strategy configuration
+├── .env                        # Environment credentials (API keys)
+├── src/                        # Rust High-Speed Live Engine
+│   ├── main.rs                 # WebSocket ingestion, strategy loop, order dispatch
+│   ├── config.rs               # Strongly-typed configuration parser
+│   ├── orders.rs               # REST OrderManager state machine
+│   ├── session.rs              # Real-time PnL & Sharpe ratio tracker
+│   └── bin/verify.rs           # API authentication verification tool
+└── backtest/                   # Python Quant Research & Optimization Suite
+    ├── strategy.py             # Pure Python CVD Momentum & Absorption strategy
+    ├── walk_forward.py         # Multi-process Optuna Walk-Forward Optimizer
+    ├── run_backtest.py         # Historical tick backtest runner
+    ├── download_data.py        # Binance Data Vision tick archive fetcher
+    └── convert_data.py         # CSV to HFT binary .npz array converter
 ```
 
 ---
 
-## Getting Started
+## Production Configuration (`config.toml`)
 
-### 1. Prerequisites
-Make sure you have Rust installed (v1.75+ recommended):
+```toml
+[general]
+api_base_url = "https://api.india.delta.exchange"
+paper_trade_mode = true
+max_concurrent_positions = 5
+trades_dir = "trades"
+log_level = "info"
+
+[websocket]
+ws_url = "wss://public-socket.india.delta.exchange"
+symbols = ["1000PEPEUSD"]
+
+[strategy]
+symbols = [
+  { symbol = "1000PEPEUSD", product_id = 114716, contract_size = 1.0, order_size = 1000,
+    tick_size = 0.00001, stop_loss_bps = 8.0, take_profit_bps = 25.0, hold_ticks = 600,
+    entry_cooldown_ticks = 2000, trailing_stop_atr_mult = 1.655861, min_trailing_stop_distance = 0.000192,
+    atr_period = 14, lookback_ticks = 24, max_price_impact_threshold = 1e-6,
+    volume_threshold = 0.369142, min_cvd_notional_usd = 10000.0, max_capacity = 62 }
+]
+```
+
+---
+
+## Quick Start Guide
+
+### 1. Build Rust Engine
 ```bash
-rustc --version
+cargo check
+cargo build --release
 ```
 
-### 2. Configure API Keys
-Create a local `.env` file in the root folder:
+### 2. Configure Environment Credentials
+Create a `.env` file in the repository root:
 ```ini
-# Delta Exchange API Credentials
-DELTA_API_KEY=your_api_key_here
-DELTA_API_SECRET=your_api_secret_here
-
-# Enable or Disable Paper Trading Evaluation (true/false)
-PAPER_TRADE_MODE=true
+DELTA_API_KEY=your_delta_api_key
+DELTA_API_SECRET=your_delta_api_secret
 ```
-*(Your `.env` file is automatically ignored by Git inside `.gitignore`.)*
 
-> **Note on Environments:** The engine is natively configured to route to Delta Exchange India (`api.india.delta.exchange`). If your API keys were generated on the Global exchange, you must change the URLs in the source code to point to `api.delta.exchange`.
-
-### 3. Verify API Keys
-Run the built-in verification binary to check if your API keys are valid and that HMAC-SHA256 signatures are properly accepted by Delta Exchange without WAF rejections:
+### 3. Verify API Authentication
 ```bash
 cargo run --bin verify
 ```
 
-### 4. Run the Trading Engine
-Start the primary order flow engine:
+### 4. Run Live Engine (Paper Mode by default)
 ```bash
-cargo run
+cargo run --release
+```
+
+### 5. Run Walk-Forward Optimization Sweep (Python)
+```bash
+python backtest/walk_forward.py --sweep
 ```
 
 ---
 
-## Configuration Parameters
-
-You can adjust limits and strategy coefficients directly in [src/main.rs](src/main.rs):
-
-| Parameter | Default | Location | Description |
-|---|---|---|---|
-| `max_capacity` | `500` | `run_strategy_engine` | Queue capacity for Prices & CVD to maximize cache performance. |
-| `lookback_ticks` | `50` | `run_strategy_engine` | Reference index offset to compute historical price/CVD divergence. |
-| `threshold` multiplier | `5.5` | `run_strategy_engine` | Coefficient factor for CVD growth divergence ($CVD_{diff} > size \times 5.5$). |
-| `order_size` | `100` | `run_strategy_engine` | Size of limit orders placed on triggered absorption events. |
-
-## Future Roadmap
-
-- **WebSocket Order Execution Migration**: While the current engine relies on an ultra-optimized REST connection (HTTP keep-alive) due to Delta Exchange API capabilities, future iterations will migrate to native WebSocket order execution when porting this strategy to platforms like Binance, Deribit, or Bybit to achieve absolute minimal order-routing latency.
-
----
-
 ## License
-MIT License. For internal and algorithmic testing purposes only. Use at your own risk.
+
+MIT License. Developed for quantitative research and automated trading execution.

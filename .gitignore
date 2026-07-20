@@ -1,2 +1,24 @@
-/target
+# Rust
+target/
+
+# Data / DB
+trades/
+backtest/data/
+backtest/processed/
+*.csv
+*.npy
+*.npz
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment / Logs
 .env
+logs/
+*.log
+
+# OS
+.DS_Store

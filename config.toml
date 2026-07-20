@@ -1,0 +1,94 @@
+# Delta Exchange Trading Engine Configuration
+# All strategy parameters are configurable here without recompilation
+
+[general]
+# REST API endpoint
+api_base_url = "https://api.india.delta.exchange"
+# Paper trading mode (true = paper, false = live)
+paper_trade_mode = true
+# Maximum concurrent positions across all symbols
+max_concurrent_positions = 5
+# Channel buffer size for trade events
+trade_channel_buffer = 1000
+# Session CSV output directory
+trades_dir = "trades"
+# Log level: trace, debug, info, warn, error
+log_level = "info"
+# Enable JSON structured logging
+json_logs = false
+# Log to file (in addition to stdout)
+log_file = "logs/engine.log"
+
+[websocket]
+# WebSocket endpoint
+ws_url = "wss://public-socket.india.delta.exchange"
+# Subscription payload
+symbols = ["1000PEPEUSD"]
+# Ping interval in seconds (0 = disabled, rely on server pings)
+ping_interval_secs = 0
+# Watchdog timeout in seconds - reconnect if no messages received
+watchdog_timeout_secs = 30
+# Reconnection exponential backoff base (seconds)
+reconnect_base_secs = 1
+# Maximum reconnection backoff (seconds)
+reconnect_max_secs = 60
+# User agent string
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+[order_manager]
+# Order request timeout (seconds)
+request_timeout_secs = 10
+# Max retry attempts for failed orders
+max_retries = 5
+# Base retry delay (seconds) - exponential backoff: base * 2^attempt
+retry_base_delay_secs = 1
+# Maximum retry delay (seconds)
+retry_max_delay_secs = 60
+# Retry on these HTTP status codes (comma-separated)
+retry_on_status = [429, 500, 502, 503, 504]
+# Enable order fill confirmation tracking
+track_fills = true
+# Fill confirmation timeout (seconds)
+fill_timeout_secs = 30
+
+[fees]
+# Taker fee rate (market orders)
+taker_fee_rate = 0.0005
+# Maker fee rate (limit orders)
+maker_fee_rate = 0.0002
+# Slippage in basis points (1 bp = 0.01%) - applied per trade
+slippage_bps = 5.0
+
+[strategy]
+# Per-symbol configurations
+symbols = [
+  # 1000PEPEUSD: ~$0.009 price (per 1,000 PEPE), extreme retail volume
+  # 1000 contracts = 1,000,000 PEPE ≈ $9.00 notional
+  # MODE: Institutional Iceberg-Absorption Fade (Volume-Weighted Price Impact).
+  # Fade massive aggressive blocks that fail to move price (low price impact);
+  # passive maker entries coat the tail of the hidden iceberg.
+  { symbol = "1000PEPEUSD", product_id = 114716, contract_size = 1.0, order_size = 1000,
+    tick_size = 0.00001, stop_loss_bps = 8.0, take_profit_bps = 25.0, hold_ticks = 600,
+    entry_cooldown_ticks = 2000, trailing_stop_atr_mult = 1.655861, min_trailing_stop_distance = 0.000192,
+    atr_period = 14, lookback_ticks = 24, max_price_impact_threshold = 1e-6,
+    volume_threshold = 0.369142, min_cvd_notional_usd = 10000.0, max_capacity = 62 },
+
+  # WIFUSD: dogwifhat linear perpetual (Delta standard layout). 1 contract = 1 WIF.
+  # Binance spot WIFUSDT reference price ~$1.6-$2.3; 10 contracts ≈ $17-$23 notional.
+  # NOTE: product_id must be verified against the live Delta product catalog before
+  # deploying to paper/live; backtest ingestion matches purely on the symbol string.
+]
+
+[session_tracking]
+# Enable detailed session analytics
+enabled = true
+# Risk-free rate for Sharpe calculation (annualized, e.g., 0.05 = 5%)
+risk_free_rate = 0.05
+# Equity curve snapshot interval (ticks)
+equity_snapshot_interval = 100
+# Initial equity for PnL tracking (USD)
+initial_equity = 10000.0
+# Estimated ticks per trading day for annualization
+ticks_per_day_estimate = 10000.0
+# Estimated ticks per trading day for Sharpe annualization
+estimated_ticks_per_day = 50000.0
