@@ -1,68 +1,40 @@
-# Institutional Order Flow Trading Engine
+# Vaelen - Institutional Order Flow & Arbitrage Trading Engine
 
-A high-performance, low-latency institutional order flow trading engine written in Rust with a parallelized zero-copy Python research and Walk-Forward Optimization (WFO) pipeline. Designed for high-frequency cryptocurrency perpetual markets on Delta Exchange.
-
-The engine implements an **Institutional Iceberg-Absorption Fade Model** based on **Volume-Weighted Price Impact**, detecting passive wall absorption in real-time, executing maker limit entries to capture fee rebates, and enforcing strict volatility-adaptive risk boundaries.
+A high-performance quantitative trading engine encompassing a low-latency Rust core for order flow momentum and a modular Python suite for structural arbitrage and strategy diagnostics. Designed primarily for cryptocurrency perpetual markets on **Delta Exchange India**.
 
 ---
 
-## Core System Architecture
+## Core Strategies
 
-```mermaid
-graph TD
-    A[Delta Exchange Market Feed] -->|WebSocket / TCP_NODELAY| B[Ingestion Layer]
-    B -->|tokio::sync::mpsc Bounded Channel| C[Strategy Engine]
-    C --> D[SymbolState Bounded Queues]
-    D -->|O(1) Hot Path| E{Iceberg Absorption Check}
-    
-    subgraph "Strategy Evaluation Circuit"
-        E -->|Lookback Window| F[Volume-Weighted Price Impact: |ΔP| / V_cum]
-        E -->|Block-Cached O(1)| G[95th Percentile Volume Filter]
-        E -->|USD Notional Gate| H[Institutional Volume Threshold]
-    end
-    
-    F & G & H -->|Signal Triggered| I{Paper Trade / Live Execution}
-    I -->|Paper Mode| J[Paper Trade Simulator & Session Tracker]
-    I -->|Live Mode| K[Order Manager & Lifecycle State Machine]
-    K -->|Post-Only Maker Limit| L[Delta Exchange REST API]
-    L -->|Fill Confirmed| M[Passive TP Limit + Taker SL Protection]
-```
+The Vaelen engine implements multiple uncorrelated strategies:
+
+### 1. Same-Venue Gold Funding Arbitrage (`XAUTUSD` vs `PAXGUSD`)
+A delta-neutral structural arbitrage strategy capitalizing on a persistent funding rate divergence between two tokenized gold perpetuals on Delta Exchange India.
+- **Edge**: `XAUTUSD` (Tether Gold) experiences high offshore leverage demand, carrying a continuous ~22% annualized funding rate. `PAXGUSD` (Paxos Gold) trades near traditional gold interest rates (~0.22%). 
+- **Execution**: Long `PAXGUSD` / Short `XAUTUSD`. 
+- **Risk Profile**: Single-venue portfolio margin nets out directional gold delta. Margin is only required to buffer transient basis de-peg noise ($\pm30-300$ bps), eliminating cross-exchange liquidation risk.
+- **Engine**: Python-based Paper Trading & Live Execution engine (`backtest/paper_trader_gold_arb.py`).
+
+### 2. Institutional Iceberg-Absorption Fade Model (Rust Core)
+A high-frequency microstructural model detecting passive wall absorption in real-time.
+- **Volume-Weighted Price Impact**: Detects institutional absorption by measuring price movement relative to taker volume over a sliding lookback window ($|\Delta P| / V_{cum}$). Fades massive taker volume when price fails to break support/resistance.
+- **Execution**: Asynchronous Rust engine executing maker limit entries to capture fee rebates. Zero-allocation hot path with bounded `VecDeque` ring buffers.
+- **O(1) Block-Cached 95th Percentile Filter**: Recomputes the rolling 1,000-tick 95th percentile volume every 500 ticks (`P95_UPDATE_INTERVAL`) with immediate cold-start initialization.
 
 ---
 
-## Key Features & Micro-Structural Design
+## Strategy Diagnostics, Evolution & Failure Points
 
-- **Volume-Weighted Price Impact Model**: Detects institutional absorption by measuring price movement relative to taker volume over a sliding lookback window ($|\Delta P| / V_{cum}$). Fades massive taker volume when price fails to break support/resistance.
-- **Zero-Allocation Hot Path**: Bounded `VecDeque` ring buffers per symbol eliminate runtime heap allocations during tick processing.
-- **O(1) Block-Cached 95th Percentile Filter**: Recomputes the rolling 1,000-tick 95th percentile volume every 500 ticks (`P95_UPDATE_INTERVAL`) with immediate cold-start initialization. Removes per-tick sorting and speeds up execution by over $30\times$.
-- **Process-Isolated Zero-Copy WFO Engine**: Uses `ProcessPoolExecutor` paired with memory-mapped array slices (`np.load(..., mmap_mode="r")`) to bypass the Python GIL and scale across multi-core architectures with zero IPC data serialization overhead.
-- **Automated Codeswitch Clause**: Continuously evaluates candidate symbols against Out-of-Sample (OOS) performance constraints ($PF_{fee} \ge 1.0$, non-zero trade count). Underperforming assets trigger an emergency drop, programmatically stripping them from `config.toml` and reverting to the isolated `1000PEPEUSD` production configuration.
-- **Maker Order Execution & Timeout Protection**: Entries are posted as maker limit orders to capture maker fee rebates. Unfilled limit entries automatically time out after 5 seconds to prevent stale execution.
-- **Asynchronous Architecture**: Built on Tokio with decoupled channel communication, non-blocking HTTP order management with retry backoff, and `TCP_NODELAY` socket optimization.
+Vaelen incorporates a rigorous quantitative pipeline with strict statistical bars ($p < 0.05$ bootstrap confidence, net-of-cost EV). A core philosophy of this project is to aggressively disprove strategies rather than blindly optimizing them. Below is the graveyard of strategies that were thoroughly audited and **killed** during development, along with their specific points of failure:
 
----
+- **v1 Iceberg Fade (Mean Reversion)**: **KILLED**. Failed due to structural adverse selection. Limit orders providing liquidity were consistently run over during directional momentum expansion phases, causing asymmetrical losses that outweighed rebate capture.
+- **v2 Momentum Breakout (incl. Scalper Offer)**: **KILLED**. Despite utilizing Delta Exchange's "Scalper Offer" (zero closing fee under 15/30 mins, effectively a 15.90 bps round-trip hurdle), the raw directional moves achieved by the signal (+0.50 to +4.40 bps) remained 4x–30x smaller than the necessary friction hurdle.
+- **v3 Perpetual vs. Spot Basis Carry**: **KILLED**. While the perpetual funding rates offered strong yield, the physical spot execution friction (spot sell fee of 16.80 bps) completely destroyed the carry advantage. Total structural friction was ~35.06 bps.
+- **v4 Cross-Exchange Perp-Perp Carry**: **KILLED**. Attempted to arbitrage funding between Binance and Bybit/Delta. The actual captured spread across 500 aligned 8h settlement periods was only 0.35–0.83 bps, massively dwarfed by asymmetric execution friction (25.76 bps). It also carried unacceptable cross-venue liquidation risk.
+- **v5 Delta Options Synthetic Cash-and-Carry**: **KILLED**. Synthesizing a dated future via Put-Call Parity failed. The 4-leg execution fees (28.88 bps) and real order book bid-ask widths entirely consumed the implied basis premium (-37 to -47 bps net EV).
+- **v6 Hedged Volatility Risk Premium (Iron Condor / Dynamic Stop-Loss)**: **KILLED**. Unhedged naked strangles showed high win rates but suffered catastrophic tail risk (-2,041 to -3,080 bps) from gap moves. Attempting to hedge this with OTM wings (Iron Condor) resulted in negative EV due to wing costs. Attempting to hedge with a dynamic stop-loss failed empirical gap-execution audits: exiting during post-breach market gaps resulted in -286 to -627 bps EV per cycle.
 
-## Mathematical & Algorithmic Model
-
-### 1. Cumulative Volume Delta (CVD) & Lookback Drift Prevention
-For each incoming trade tick $i$ with price $P_i$, size $S_i$, and aggressor direction $D_i \in \{+1 \text{ (buy)}, -1 \text{ (sell)}\}$:
-
-$$\text{CVD}_i = \text{CVD}_{i-1} + D_i \cdot S_i$$
-
-The rolling volume over lookback window $L$ is precisely maintained without lookback drift:
-
-$$V_{cum, i} = \sum_{k=i-L+1}^{i} S_k$$
-
-### 2. Volume-Weighted Price Impact
-$$\text{Price Impact}_i = \frac{|P_i - P_{i-L}|}{V_{cum, i}}$$
-
-An absorption event occurs when $V_{cum, i} \cdot P_i > \text{min\_cvd\_notional\_usd}$, $S_i > \text{P95}(V)$, and:
-
-$$\text{Price Impact}_i < \text{max\_price\_impact\_threshold}$$
-
-### 3. Signal Generation
-- **Short Fade**: Aggressive buying ($\text{CVD}_i > \text{CVD}_{i-L}$) but price hits a ceiling ($\Delta P_i \le 0$).
-- **Long Fade**: Aggressive selling ($\text{CVD}_i < \text{CVD}_{i-L}$) but price hits a floor ($\Delta P_i \ge 0$).
+These extensive failures ultimately led to the discovery and validation of the **Same-Venue Gold Funding Arbitrage** strategy, which bypasses cross-venue liquidation risk, physical spot fees, and options bid-ask width by trading highly liquid perpetuals on a single margin engine.
 
 ---
 
@@ -79,70 +51,69 @@ $$\text{Price Impact}_i < \text{max\_price\_impact\_threshold}$$
 │   ├── orders.rs               # REST OrderManager state machine
 │   ├── session.rs              # Real-time PnL & Sharpe ratio tracker
 │   └── bin/verify.rs           # API authentication verification tool
-└── backtest/                   # Python Quant Research & Optimization Suite
+└── backtest/                   # Python Quant Research, Diagnostics, & Arbitrage Suite
+    ├── paper_trader_gold_arb.py# Core Gold Funding Arb Execution Engine
+    ├── run_gold_arb_paper.py   # Gold Arb CLI Runner & Telemetry Logger
+    ├── symbol_validation.py    # Standing live product API validation
+    ├── stress_test_gold_arb.py # Gold Arb De-Peg Margin Shock Simulator
     ├── strategy.py             # Pure Python CVD Momentum & Absorption strategy
     ├── walk_forward.py         # Multi-process Optuna Walk-Forward Optimizer
-    ├── run_backtest.py         # Historical tick backtest runner
-    ├── download_data.py        # Binance Data Vision tick archive fetcher
-    └── convert_data.py         # CSV to HFT binary .npz array converter
+    └── [diagnostic scripts...] # Extensive suite of killed-strategy post-mortems
 ```
 
 ---
 
 ## Production Configuration (`config.toml`)
 
+The configuration file handles both the Rust HFT engine and the Python Gold Arbitrage suite.
+
 ```toml
 [general]
 api_base_url = "https://api.india.delta.exchange"
 paper_trade_mode = true
-max_concurrent_positions = 5
-trades_dir = "trades"
-log_level = "info"
 
-[websocket]
-ws_url = "wss://public-socket.india.delta.exchange"
-symbols = ["1000PEPEUSD"]
-
-[strategy]
-symbols = [
-  { symbol = "1000PEPEUSD", product_id = 114716, contract_size = 1.0, order_size = 1000,
-    tick_size = 0.00001, stop_loss_bps = 8.0, take_profit_bps = 25.0, hold_ticks = 600,
-    entry_cooldown_ticks = 2000, trailing_stop_atr_mult = 1.655861, min_trailing_stop_distance = 0.000192,
-    atr_period = 14, lookback_ticks = 24, max_price_impact_threshold = 1e-6,
-    volume_threshold = 0.369142, min_cvd_notional_usd = 10000.0, max_capacity = 62 }
-]
+[gold_arb]
+enabled = true
+api_host = "https://api.india.delta.exchange"
+leg_long = "PAXGUSD"
+leg_short = "XAUTUSD"
+effective_leverage = 3.0
+position_sizing_pct = 0.50
+max_depeg_stop_loss_bps = 300.0
+paper_trading_initial_balance = 10000.0
 ```
 
 ---
 
 ## Quick Start Guide
 
-### 1. Build Rust Engine
-```bash
-cargo check
-cargo build --release
-```
-
-### 2. Configure Environment Credentials
+### 1. Configure Environment Credentials
 Create a `.env` file in the repository root:
 ```ini
 DELTA_API_KEY=your_delta_api_key
 DELTA_API_SECRET=your_delta_api_secret
 ```
 
-### 3. Verify API Authentication
+### 2. Run the Gold Funding Arbitrage Paper Trader (Python)
+Launch the paper trading engine to test execution and log real-time 8-hour funding accruals:
+
+**Test Mode (Runs 3 cycles and exits):**
 ```bash
-cargo run --bin verify
+python backtest/run_gold_arb_paper.py --test-run --cycles 3
 ```
 
-### 4. Run Live Engine (Paper Mode by default)
+**Continuous Live Logging Mode (10s intervals):**
 ```bash
-cargo run --release
+python backtest/run_gold_arb_paper.py --interval 10
 ```
+Telemetry is automatically logged to `backtest/logs/gold_arb_telemetry.csv`.
 
-### 5. Run Walk-Forward Optimization Sweep (Python)
+### 3. Build & Run the Rust HFT Engine
 ```bash
-python backtest/walk_forward.py --sweep
+cargo check
+cargo build --release
+cargo run --bin verify   # Verify API Auth
+cargo run --release      # Run Live Engine (defaults to Paper Mode)
 ```
 
 ---

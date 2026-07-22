@@ -92,3 +92,17 @@ initial_equity = 10000.0
 ticks_per_day_estimate = 10000.0
 # Estimated ticks per trading day for Sharpe annualization
 estimated_ticks_per_day = 50000.0
+
+[gold_arb]
+enabled = true
+api_host = "https://api.india.delta.exchange"
+leg_long = "PAXGUSD"
+leg_short = "XAUTUSD"
+effective_leverage = 3.0
+position_sizing_pct = 0.50
+target_contracts = 9
+max_depeg_stop_loss_bps = 300.0
+paper_trading_initial_balance = 50.0
+poll_interval_sec = 10
+funding_interval_hours = 8
+

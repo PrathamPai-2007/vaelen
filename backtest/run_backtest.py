@@ -3,6 +3,7 @@ import sys
 import toml
 import numpy as np
 from strategy import CVDMomentumStrategy
+from symbol_validation import validate_symbol_config
 
 def load_toml_config():
     config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../config.toml'))
@@ -34,15 +35,14 @@ def run_backtest(npz_file, target_symbol):
         symbol_config['tick_size'] = 0.00000001
 
     data = np.load(npz_file)['data']
+    sample_price = float(data['px'][0]) if len(data) > 0 else None
+
+    # Permanent assertion check prior to simulation
+    validate_symbol_config(symbol_config, target_symbol=target_symbol, sample_price=sample_price)
 
     # --- NO AUTO-SCALING: use config values directly ---
     # The 95th percentile volume filter and WFO guardrails handle regime adaptation.
-    # Cooldown and hold are hard-coded to guardrail-validated values.
-    symbol_config['entry_cooldown_ticks'] = 75
-    symbol_config['hold_ticks'] = 600
-
-    # min_cvd_notional_usd is already dollar-denominated and scale-invariant;
-    # no per-asset unit conversion required.
+    # Cooldown and hold use config.toml production values (no hardcoded overrides).
 
     print(f"\n--- RAW PARAMETERS (no scaling) ---")
     print(f"lookback_ticks:       {symbol_config['lookback_ticks']}")

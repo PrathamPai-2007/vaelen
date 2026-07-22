@@ -1,0 +1,52 @@
+# Delta Exchange Trading Engine Configuration (ARCHIVED v1 SNAPSHOT)
+# Strategy: Institutional Iceberg-Absorption Fade (KILLED)
+
+[general]
+api_base_url = "https://api.india.delta.exchange"
+paper_trade_mode = true
+max_concurrent_positions = 5
+trade_channel_buffer = 1000
+trades_dir = "trades"
+log_level = "info"
+json_logs = false
+log_file = "logs/engine.log"
+
+[websocket]
+ws_url = "wss://public-socket.india.delta.exchange"
+symbols = ["1000PEPEUSD"]
+ping_interval_secs = 0
+watchdog_timeout_secs = 30
+reconnect_base_secs = 1
+reconnect_max_secs = 60
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+[order_manager]
+request_timeout_secs = 10
+max_retries = 5
+retry_base_delay_secs = 1
+retry_max_delay_secs = 60
+retry_on_status = [429, 500, 502, 503, 504]
+track_fills = true
+fill_timeout_secs = 30
+
+[fees]
+taker_fee_rate = 0.0005
+maker_fee_rate = 0.0002
+slippage_bps = 5.0
+
+[strategy]
+symbols = [
+  { symbol = "1000PEPEUSD", product_id = 114716, contract_size = 1.0, order_size = 1000,
+    tick_size = 0.00001, stop_loss_bps = 8.0, take_profit_bps = 25.0, hold_ticks = 600,
+    entry_cooldown_ticks = 2000, trailing_stop_atr_mult = 1.655861, min_trailing_stop_distance = 0.000192,
+    atr_period = 14, lookback_ticks = 24, max_price_impact_threshold = 1e-6,
+    volume_threshold = 0.369142, min_cvd_notional_usd = 10000.0, max_capacity = 62 }
+]
+
+[session_tracking]
+enabled = true
+risk_free_rate = 0.05
+equity_snapshot_interval = 100
+initial_equity = 10000.0
+ticks_per_day_estimate = 10000.0
+estimated_ticks_per_day = 50000.0
