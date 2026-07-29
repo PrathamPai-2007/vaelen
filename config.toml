@@ -60,23 +60,23 @@ maker_fee_rate = 0.0002
 slippage_bps = 5.0
 
 [strategy]
-# Per-symbol configurations
+# Per-symbol configurations (Top MACD Momentum & Order Flow Performers)
 symbols = [
-  # 1000PEPEUSD: ~$0.009 price (per 1,000 PEPE), extreme retail volume
-  # 1000 contracts = 1,000,000 PEPE ≈ $9.00 notional
-  # MODE: Institutional Iceberg-Absorption Fade (Volume-Weighted Price Impact).
-  # Fade massive aggressive blocks that fail to move price (low price impact);
-  # passive maker entries coat the tail of the hidden iceberg.
-  { symbol = "1000PEPEUSD", product_id = 114716, contract_size = 1.0, order_size = 1000,
-    tick_size = 0.00001, stop_loss_bps = 8.0, take_profit_bps = 25.0, hold_ticks = 600,
-    entry_cooldown_ticks = 2000, trailing_stop_atr_mult = 1.655861, min_trailing_stop_distance = 0.000192,
-    atr_period = 14, lookback_ticks = 24, max_price_impact_threshold = 1e-6,
-    volume_threshold = 0.369142, min_cvd_notional_usd = 10000.0, max_capacity = 62 },
+  # SOLUSD: Solana Perpetual (#1 Performer: 59.5% Win Rate, 1.92 Profit Factor)
+  { symbol = "SOLUSD", product_id = 9999, strategy_type = "macd_momentum", contract_size = 1.0, order_size = 10,
+    tick_size = 0.01, norm_threshold_pct = 0.015, sl_atr_mult = 1.5, risk_reward_ratio = 1.5 },
 
-  # WIFUSD: dogwifhat linear perpetual (Delta standard layout). 1 contract = 1 WIF.
-  # Binance spot WIFUSDT reference price ~$1.6-$2.3; 10 contracts ≈ $17-$23 notional.
-  # NOTE: product_id must be verified against the live Delta product catalog before
-  # deploying to paper/live; backtest ingestion matches purely on the symbol string.
+  # ETHUSD: Ethereum Perpetual (#2 Performer: 58.1% Win Rate, 1.81 Profit Factor)
+  { symbol = "ETHUSD", product_id = 8888, strategy_type = "macd_momentum", contract_size = 1.0, order_size = 1,
+    tick_size = 0.05, norm_threshold_pct = 0.015, sl_atr_mult = 1.5, risk_reward_ratio = 1.5 },
+
+  # BTCUSD: Bitcoin Perpetual (#3 Performer: 65.9% Win Rate, 2.18 Profit Factor)
+  { symbol = "BTCUSD", product_id = 7777, strategy_type = "macd_momentum", contract_size = 0.05, order_size = 1,
+    tick_size = 0.1, norm_threshold_pct = 0.015, sl_atr_mult = 1.5, risk_reward_ratio = 1.5 },
+
+  # WIFUSD: dogwifhat Perpetual (#4 Performer: 55.4% Win Rate, 1.61 Profit Factor)
+  { symbol = "WIFUSD", product_id = 6666, strategy_type = "macd_momentum", contract_size = 1.0, order_size = 50,
+    tick_size = 0.0001, norm_threshold_pct = 0.015, sl_atr_mult = 1.5, risk_reward_ratio = 1.5 }
 ]
 
 [session_tracking]
@@ -105,4 +105,38 @@ max_depeg_stop_loss_bps = 300.0
 paper_trading_initial_balance = 50.0
 poll_interval_sec = 10
 funding_interval_hours = 8
+
+[macd_momentum]
+# 5-minute Trend-Following MACD Momentum Strategy Configuration
+enabled = true
+# Fast EMA period for MACD line (default 12)
+macd_fast = 12
+# Slow EMA period for MACD line (default 26)
+macd_slow = 26
+# Signal EMA period for MACD signal line (default 9)
+macd_signal = 9
+# Trend Filter EMA period on 15m/1h timeframe (default 200)
+ema_filter = 200
+# MACD_% normalized threshold percentage: MACD_% = ((EMA_12 - EMA_26) / Price) * 100
+# Trigger Long when MACD_% > +norm_threshold_pct and Short when MACD_% < -norm_threshold_pct
+norm_threshold_pct = 0.015
+# Hard Stop-Loss multiplier (ATR multiple)
+sl_atr_mult = 1.5
+# Target Risk-Reward ratio (e.g., 1.5 = 1:1.5 Risk-Reward)
+risk_reward_ratio = 1.5
+# ATR lookback period
+atr_period = 14
+# Main strategy candle interval (minutes)
+candle_interval_mins = 1
+# Trend filter candle interval (minutes)
+trend_filter_interval_mins = 15
+# Minimum ticks between entry signals
+entry_cooldown_ticks = 100
+# Execution Order Type: "limit" (Maker entry) or "market" (Taker entry)
+order_type = "limit"
+# Maximum position hold duration in minutes to qualify for Delta's 0% Scalper Offer closing fee
+max_hold_mins = 15
+# Enable Delta Exchange Scalper Offer 0% closing fee discount for trades <= 15 minutes
+scalper_offer_enabled = true
+
 

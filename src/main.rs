@@ -141,6 +141,17 @@ pub struct SymbolState {
     pub rolling_volume_sq_sum: f64,
     pub rolling_buy_volume: f64,
     pub rolling_sell_volume: f64,
+    // MACD & Trend Filter state fields
+    pub candle_5m_closes: VecDeque<f64>,
+    pub candle_15m_closes: VecDeque<f64>,
+    pub current_5m_start_ts: u64,
+    pub current_15m_start_ts: u64,
+    pub ema_fast_val: Option<f64>,
+    pub ema_slow_val: Option<f64>,
+    pub ema_signal_val: Option<f64>,
+    pub ema_200_trend_val: Option<f64>,
+    pub prev_macd_pct: f64,
+    pub curr_macd_pct: f64,
 }
 
 impl SymbolState {
@@ -163,6 +174,16 @@ impl SymbolState {
             rolling_volume_sq_sum: 0.0,
             rolling_buy_volume: 0.0,
             rolling_sell_volume: 0.0,
+            candle_5m_closes: VecDeque::with_capacity(1000),
+            candle_15m_closes: VecDeque::with_capacity(1000),
+            current_5m_start_ts: 0,
+            current_15m_start_ts: 0,
+            ema_fast_val: None,
+            ema_slow_val: None,
+            ema_signal_val: None,
+            ema_200_trend_val: None,
+            prev_macd_pct: 0.0,
+            curr_macd_pct: 0.0,
         }
     }
 }
@@ -714,8 +735,182 @@ pub async fn run_strategy_engine(
             }
         }
 
+        // --- MACD Momentum Strategy & Trend Filter Calculations ---
+        let macd_cfg = config.macd_momentum.as_ref();
+        let macd_fast = symbol_config.macd_fast.unwrap_or_else(|| macd_cfg.map(|c| c.macd_fast).unwrap_or(12));
+        let macd_slow = symbol_config.macd_slow.unwrap_or_else(|| macd_cfg.map(|c| c.macd_slow).unwrap_or(26));
+        let macd_signal = symbol_config.macd_signal.unwrap_or_else(|| macd_cfg.map(|c| c.macd_signal).unwrap_or(9));
+        let ema_filter = symbol_config.ema_filter.unwrap_or_else(|| macd_cfg.map(|c| c.ema_filter).unwrap_or(200));
+        let norm_threshold_pct = symbol_config.norm_threshold_pct.unwrap_or_else(|| macd_cfg.map(|c| c.norm_threshold_pct).unwrap_or(0.15));
+        let sl_atr_mult = symbol_config.sl_atr_mult.unwrap_or_else(|| macd_cfg.map(|c| c.sl_atr_mult).unwrap_or(1.5));
+        let risk_reward_ratio = symbol_config.risk_reward_ratio.unwrap_or_else(|| macd_cfg.map(|c| c.risk_reward_ratio).unwrap_or(1.5));
+        let candle_mins = symbol_config.candle_interval_mins.unwrap_or_else(|| macd_cfg.map(|c| c.candle_interval_mins).unwrap_or(5));
+        let trend_mins = symbol_config.trend_filter_interval_mins.unwrap_or_else(|| macd_cfg.map(|c| c.trend_filter_interval_mins).unwrap_or(15));
+        let macd_cooldown_ticks = symbol_config.entry_cooldown_ticks;
+
+        let alpha_fast = 2.0 / (macd_fast as f64 + 1.0);
+        let alpha_slow = 2.0 / (macd_slow as f64 + 1.0);
+        let alpha_signal = 2.0 / (macd_signal as f64 + 1.0);
+        let alpha_200 = 2.0 / (ema_filter as f64 + 1.0);
+
+        let trade_ts_sec = now_secs;
+        let interval_15m_sec = (trend_mins as u64) * 60;
+        let bucket_15m = (trade_ts_sec / interval_15m_sec) * interval_15m_sec;
+
+        if state.current_15m_start_ts == 0 {
+            state.current_15m_start_ts = bucket_15m;
+            state.ema_200_trend_val = Some(price);
+        } else if bucket_15m > state.current_15m_start_ts || state.ema_200_trend_val.is_none() {
+            state.current_15m_start_ts = bucket_15m;
+            let next_200 = match state.ema_200_trend_val {
+                Some(prev) => price * alpha_200 + prev * (1.0 - alpha_200),
+                None => price,
+            };
+            state.ema_200_trend_val = Some(next_200);
+        }
+
+        let interval_5m_sec = (candle_mins as u64) * 60;
+        let bucket_5m = (trade_ts_sec / interval_5m_sec) * interval_5m_sec;
+
+        if state.current_5m_start_ts == 0 || state.ema_fast_val.is_none() {
+            state.current_5m_start_ts = bucket_5m;
+            state.ema_fast_val = Some(price);
+            state.ema_slow_val = Some(price);
+            state.ema_signal_val = Some(0.0);
+        } else {
+            let next_fast = price * alpha_fast + state.ema_fast_val.unwrap() * (1.0 - alpha_fast);
+            let next_slow = price * alpha_slow + state.ema_slow_val.unwrap() * (1.0 - alpha_slow);
+            state.ema_fast_val = Some(next_fast);
+            state.ema_slow_val = Some(next_slow);
+        }
+
+        let macd_line = state.ema_fast_val.unwrap() - state.ema_slow_val.unwrap();
+        let macd_pct = (macd_line / price) * 100.0;
+
+        let next_signal = match state.ema_signal_val {
+            Some(prev) => macd_line * alpha_signal + prev * (1.0 - alpha_signal),
+            None => macd_line,
+        };
+        state.ema_signal_val = Some(next_signal);
+
+        state.prev_macd_pct = state.curr_macd_pct;
+        state.curr_macd_pct = macd_pct;
+
+        let active_count = if paper_trade_mode { state.active_paper_trades.len() } else { state.active_live_trades.len() };
+        let cooldown_elapsed = state.total_ticks.saturating_sub(state.last_entry_tick) >= macd_cooldown_ticks;
+        let is_macd_strategy = symbol_config.strategy_type == "macd_momentum"
+            || (symbol_config.strategy_type != "cvd_iceberg" && macd_cfg.map(|c| c.enabled).unwrap_or(false));
+
+        if is_macd_strategy && cooldown_elapsed && active_count < max_concurrent_positions {
+            let ema_200 = state.ema_200_trend_val.unwrap_or(price);
+
+            // Go Long: MACD_% crosses ABOVE +X% threshold AND Price > 200 EMA
+            let long_signal = state.prev_macd_pct <= norm_threshold_pct
+                && state.curr_macd_pct > norm_threshold_pct
+                && price > ema_200;
+
+            // Go Short: MACD_% crosses BELOW -X% threshold AND Price < 200 EMA
+            let short_signal = state.prev_macd_pct >= -norm_threshold_pct
+                && state.curr_macd_pct < -norm_threshold_pct
+                && price < ema_200;
+
+            if long_signal {
+                let sl_dist = sl_atr_mult * atr;
+                let tp_dist = sl_dist * risk_reward_ratio;
+                let stop_loss_price = price - sl_dist;
+                let take_profit_price = price + tp_dist;
+                let order_size = symbol_config.order_size;
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+                info!(
+                    "[{}] MACD Momentum Long @ {}, MACD_%: {:.4}%, EMA200: {:.5}, SL: {:.5}, TP: {:.5}, ATR: {:.5}",
+                    symbol, price, state.curr_macd_pct, ema_200, stop_loss_price, take_profit_price, atr
+                );
+
+                if paper_trade_mode {
+                    state.active_paper_trades.push(PaperTrade {
+                        entry_time: now, entry_price: price, side: "buy".to_string(),
+                        size: order_size, ticks_elapsed: 0, highest_price: price, lowest_price: price,
+                        stop_loss_price, take_profit_price,
+                    });
+                    state.last_entry_tick = state.total_ticks;
+                } else {
+                    let order_result = order_manager.place_order_with_retry(
+                        symbol_config.product_id,
+                        Some(price),
+                        order_size,
+                        "buy",
+                        "limit",
+                        config.order_manager.max_retries,
+                        config.order_manager.retry_base_delay_secs,
+                        config.order_manager.retry_max_delay_secs,
+                        &config.order_manager.retry_on_status,
+                    ).await;
+
+                    match order_result {
+                        OrderResult::Open(fill) | OrderResult::Partial(fill) | OrderResult::Filled(fill) => {
+                            state.active_orders.push(ActiveOrder {
+                                id: fill.order_id, price, side: "buy".to_string(), size: order_size,
+                                created_at: now, kind: "Entry".to_string(),
+                            });
+                            state.last_entry_tick = state.total_ticks;
+                        }
+                        OrderResult::Failed(e) => {
+                            error!("[{}] Failed to open MACD Long position: {}", symbol, e);
+                        }
+                    }
+                }
+            } else if short_signal {
+                let sl_dist = sl_atr_mult * atr;
+                let tp_dist = sl_dist * risk_reward_ratio;
+                let stop_loss_price = price + sl_dist;
+                let take_profit_price = price - tp_dist;
+                let order_size = symbol_config.order_size;
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+                info!(
+                    "[{}] MACD Momentum Short @ {}, MACD_%: {:.4}%, EMA200: {:.5}, SL: {:.5}, TP: {:.5}, ATR: {:.5}",
+                    symbol, price, state.curr_macd_pct, ema_200, stop_loss_price, take_profit_price, atr
+                );
+
+                if paper_trade_mode {
+                    state.active_paper_trades.push(PaperTrade {
+                        entry_time: now, entry_price: price, side: "sell".to_string(),
+                        size: order_size, ticks_elapsed: 0, highest_price: price, lowest_price: price,
+                        stop_loss_price, take_profit_price,
+                    });
+                    state.last_entry_tick = state.total_ticks;
+                } else {
+                    let order_result = order_manager.place_order_with_retry(
+                        symbol_config.product_id,
+                        Some(price),
+                        order_size,
+                        "sell",
+                        "limit",
+                        config.order_manager.max_retries,
+                        config.order_manager.retry_base_delay_secs,
+                        config.order_manager.retry_max_delay_secs,
+                        &config.order_manager.retry_on_status,
+                    ).await;
+
+                    match order_result {
+                        OrderResult::Open(fill) | OrderResult::Partial(fill) | OrderResult::Filled(fill) => {
+                            state.active_orders.push(ActiveOrder {
+                                id: fill.order_id, price, side: "sell".to_string(), size: order_size,
+                                created_at: now, kind: "Entry".to_string(),
+                            });
+                            state.last_entry_tick = state.total_ticks;
+                        }
+                        OrderResult::Failed(e) => {
+                            error!("[{}] Failed to open MACD Short position: {}", symbol, e);
+                        }
+                    }
+                }
+            }
+        }
+
         let current_len = state.price_queue.len();
-        if current_len > symbol_config.lookback_ticks {
+        if symbol_config.strategy_type == "cvd_iceberg" && current_len > symbol_config.lookback_ticks {
             let past_index = current_len - 1 - symbol_config.lookback_ticks;
             if let (Some(&past_price), Some(&past_cvd)) =
                 (state.price_queue.get(past_index), state.cvd_queue.get(past_index))
@@ -728,7 +923,6 @@ pub async fn run_strategy_engine(
                     0.0
                 };
                 let volume_spike = size > state.cached_p95_volume;
-                let active_count = if paper_trade_mode { state.active_paper_trades.len() } else { state.active_live_trades.len() };
                 let cooldown_elapsed = state.total_ticks.saturating_sub(state.last_entry_tick) >= symbol_config.entry_cooldown_ticks;
 
                 let can_absorb = volume_spike

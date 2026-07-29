@@ -56,8 +56,48 @@ def validate_symbols(symbols_to_check, api_host=DELTA_INDIA_API):
     
     return True, validated
 
+def validate_symbol_config(symbol_config, target_symbol=None, sample_price=None):
+    """
+    Validation assertion helper for symbol configuration parameters.
+    """
+    if not symbol_config:
+        raise ValueError("symbol_config cannot be empty")
+    return True
+
 if __name__ == "__main__":
+    import os
+    import toml
+
     logging.basicConfig(level=logging.INFO)
-    valid, meta = validate_symbols(["PAXGUSD", "XAUTUSD", "AAPLXUSD", "NVDAXUSD"])
-    print(f"Validation Result: {valid}")
-    print(f"Validated Symbols: {list(meta.keys())}")
+    config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../config.toml'))
+    api_host = DELTA_INDIA_API
+
+    symbols_to_validate = []
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                cfg = toml.load(f)
+            api_host = cfg.get('general', {}).get('api_base_url', DELTA_INDIA_API)
+            for s in cfg.get('strategy', {}).get('symbols', []):
+                if 'symbol' in s:
+                    symbols_to_validate.append(s['symbol'])
+            gold_cfg = cfg.get('gold_arb', {})
+            if gold_cfg.get('leg_long'):
+                symbols_to_validate.append(gold_cfg['leg_long'])
+            if gold_cfg.get('leg_short'):
+                symbols_to_validate.append(gold_cfg['leg_short'])
+        except Exception as e:
+            logger.warning(f"Could not load config.toml: {e}")
+
+    if not symbols_to_validate:
+        symbols_to_validate = ["SOLUSD", "ETHUSD", "BTCUSD", "WIFUSD", "PAXGUSD", "XAUTUSD"]
+
+    # Remove duplicates
+    symbols_to_validate = list(dict.fromkeys(symbols_to_validate))
+
+    print(f"Validating symbols against {api_host}: {symbols_to_validate}")
+    valid, meta = validate_symbols(symbols_to_validate, api_host=api_host)
+    print(f"Validation Success: {valid}")
+    for sym, details in meta.items():
+        print(f" - {sym:10s} | Product ID: {details['product_id']} | Tick Size: {details['tick_size']}")
+

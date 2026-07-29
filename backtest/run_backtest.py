@@ -2,7 +2,7 @@ import os
 import sys
 import toml
 import numpy as np
-from strategy import CVDMomentumStrategy
+from strategy import CVDMomentumStrategy, MACDMomentumStrategy
 from symbol_validation import validate_symbol_config
 
 def load_toml_config():
@@ -10,7 +10,7 @@ def load_toml_config():
     with open(config_path, 'r') as f:
         return toml.load(f)
 
-def run_backtest(npz_file, target_symbol):
+def run_backtest(npz_file, target_symbol, strategy_name=None):
     config = load_toml_config()
 
     # Extract symbol config
@@ -40,22 +40,21 @@ def run_backtest(npz_file, target_symbol):
     # Permanent assertion check prior to simulation
     validate_symbol_config(symbol_config, target_symbol=target_symbol, sample_price=sample_price)
 
-    # --- NO AUTO-SCALING: use config values directly ---
-    # The 95th percentile volume filter and WFO guardrails handle regime adaptation.
-    # Cooldown and hold use config.toml production values (no hardcoded overrides).
+    selected_strategy_type = strategy_name or symbol_config.get('strategy_type', 'cvd_iceberg')
 
-    print(f"\n--- RAW PARAMETERS (no scaling) ---")
-    print(f"lookback_ticks:       {symbol_config['lookback_ticks']}")
-    print(f"entry_cooldown_ticks: {symbol_config['entry_cooldown_ticks']}")
-    print(f"hold_ticks:           {symbol_config['hold_ticks']}")
-    print(f"min_cvd_notional_usd: {symbol_config['min_cvd_notional_usd']:.4f} USD")
-    print(f"stop_loss_bps:        {symbol_config['stop_loss_bps']}")
-    print(f"take_profit_bps:      {symbol_config['take_profit_bps']}")
+    print(f"\n--- STRATEGY BACKTEST CONFIG ({selected_strategy_type.upper()}) ---")
+    print(f"Symbol:               {target_symbol}")
+    print(f"Contract Size:        {symbol_config['contract_size']}")
+    print(f"Order Size:           {symbol_config['order_size']}")
     print("------------------------------------\n")
 
     # Run strategy simulation
-    strategy = CVDMomentumStrategy(None, symbol_config, config)
-    print("Processing simulation...")
+    if selected_strategy_type == "macd_momentum" or selected_strategy_type == "macd":
+        strategy = MACDMomentumStrategy(None, symbol_config, config)
+    else:
+        strategy = CVDMomentumStrategy(None, symbol_config, config)
+
+    print(f"Processing simulation using {strategy.__class__.__name__}...")
 
     for row in data:
         strategy.on_tick(row)
@@ -68,6 +67,7 @@ def run_backtest(npz_file, target_symbol):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python run_backtest.py <npz_file> <symbol>")
+        print("Usage: python run_backtest.py <npz_file> <symbol> [strategy_name]")
         sys.exit(1)
-    run_backtest(sys.argv[1], sys.argv[2])
+    strat = sys.argv[3] if len(sys.argv) > 3 else None
+    run_backtest(sys.argv[1], sys.argv[2], strat)

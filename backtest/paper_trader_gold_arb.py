@@ -4,7 +4,10 @@ import time
 import datetime
 import os
 import logging
-from backtest.symbol_validation import validate_symbols, DELTA_INDIA_API
+try:
+    from symbol_validation import validate_symbols, DELTA_INDIA_API
+except ImportError:
+    from backtest.symbol_validation import validate_symbols, DELTA_INDIA_API
 
 logger = logging.getLogger("GoldArbPaperTrader")
 
