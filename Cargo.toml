@@ -26,3 +26,6 @@ anyhow = "1.0.81"
 thiserror = "1.0.61"
 parking_lot = "0.12.3"
 serde_with = "3.5.0"
+rand = "0.10.2"
+uuid = { version = "1.24.0", features = ["v4"] }
+rhai = { version = "1.26.0", features = ["sync"] }

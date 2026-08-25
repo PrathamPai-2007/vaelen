@@ -81,16 +81,11 @@ if __name__ == "__main__":
             for s in cfg.get('strategy', {}).get('symbols', []):
                 if 'symbol' in s:
                     symbols_to_validate.append(s['symbol'])
-            gold_cfg = cfg.get('gold_arb', {})
-            if gold_cfg.get('leg_long'):
-                symbols_to_validate.append(gold_cfg['leg_long'])
-            if gold_cfg.get('leg_short'):
-                symbols_to_validate.append(gold_cfg['leg_short'])
         except Exception as e:
             logger.warning(f"Could not load config.toml: {e}")
 
     if not symbols_to_validate:
-        symbols_to_validate = ["SOLUSD", "ETHUSD", "BTCUSD", "WIFUSD", "PAXGUSD", "XAUTUSD"]
+        symbols_to_validate = ["1000PEPEUSD", "WIFUSD", "SOLUSD", "ETHUSD", "BTCUSD"]
 
     # Remove duplicates
     symbols_to_validate = list(dict.fromkeys(symbols_to_validate))

@@ -1,16 +1,14 @@
 import sys
 import os
+import struct
 import numpy as np
 import pandas as pd
-from hftbacktest import event_dtype, TRADE_EVENT, BUY_EVENT, SELL_EVENT
 
-def convert_csv(input_csv, output_npz):
+def convert_csv(input_csv, output_bin):
     print(f"Reading raw CSV: {input_csv}...")
     
-    # Read the first line to check if it's headerless
     first_row = pd.read_csv(input_csv, nrows=1, header=None)
     try:
-        # If the first column is a number, it's headerless
         float(first_row.iloc[0, 0])
         has_header = False
     except (ValueError, TypeError):
@@ -26,46 +24,52 @@ def convert_csv(input_csv, output_npz):
     else:
         df = pd.read_csv(input_csv)
     
-    # Auto-detect format: Binance Data Vision vs Tardis vs Generic
     if 'is_buyer_maker' in df.columns:
-        print("Detected Binance Data Vision format (Free Source)...")
-        # Time is in microseconds or milliseconds. Let's check scale.
+        print("Detected Binance format...")
         sample_time = df['time'].iloc[0]
-        # If timestamp is > 1e15, it's in microseconds. If > 1e12, it's milliseconds.
         if sample_time > 1e15:
-            local_ts = df['time'].astype(np.int64) * 1_000
+            exch_ts = df['time'].astype(np.uint64) * 1_000
         else:
-            local_ts = df['time'].astype(np.int64) * 1_000_000
-        exch_ts = local_ts
-        # is_buyer_maker == True means Taker was Sell
-        is_buy = df['is_buyer_maker'] == False
+            exch_ts = df['time'].astype(np.uint64) * 1_000_000
+        is_buy = (df['is_buyer_maker'] == False).astype(np.uint8)
         price = df['price'].astype(np.float64)
         qty = df['qty'].astype(np.float64)
     elif 'local_timestamp' in df.columns:
         print("Detected Tardis / Generic format...")
         sample_ts = df['local_timestamp'].iloc[0]
         mult = 1_000 if sample_ts < 1e16 else 1
-        local_ts = df['local_timestamp'].astype(np.int64) * mult
-        exch_ts = df['timestamp'].astype(np.int64) * mult
-        is_buy = df['side'] == 'buy'
+        exch_ts = (df['timestamp'].astype(np.uint64) * mult)
+        is_buy = (df['side'] == 'buy').astype(np.uint8)
         price = df['price'].astype(np.float64)
         qty = df['amount'].astype(np.float64)
     else:
-        raise ValueError("Unknown CSV format! Expected Tardis or Binance Data Vision columns.")
+        raise ValueError("Unknown CSV format!")
 
-    hft_data = np.zeros(len(df), dtype=event_dtype)
-    hft_data['ev'] = np.where(is_buy, TRADE_EVENT | BUY_EVENT, TRADE_EVENT | SELL_EVENT)
-    hft_data['local_ts'] = local_ts
-    hft_data['exch_ts'] = exch_ts
-    hft_data['px'] = price
-    hft_data['qty'] = qty
+    print(f"Total ticks: {len(df)}")
+    print(f"Saving to flat binary struct format: {output_bin}...")
+    
+    dt = np.dtype([
+        ('ts', np.uint64),
+        ('px', np.float64),
+        ('qty', np.float64),
+        ('is_buy', np.uint8),
+        ('padding', 'V7') # 7 bytes padding
+    ])
+    
+    out_arr = np.empty(len(df), dtype=dt)
+    out_arr['ts'] = exch_ts.values
+    out_arr['px'] = price.values
+    out_arr['qty'] = qty.values
+    out_arr['is_buy'] = is_buy.values
+    out_arr['padding'] = 0
+    
+    with open(output_bin, "wb") as f:
+        f.write(out_arr.tobytes())
 
-    print(f"Saving to binary HftBacktest format: {output_npz}...")
-    np.savez(output_npz, data=hft_data)
     print("Conversion complete!")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python convert_data.py <input_csv> <output_npz>")
+        print("Usage: python convert_data.py <input_csv> <output_bin>")
         sys.exit(1)
     convert_csv(sys.argv[1], sys.argv[2])

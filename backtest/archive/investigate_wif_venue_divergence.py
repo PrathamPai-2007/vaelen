@@ -37,13 +37,16 @@ def compare_wif():
     print(f"Mark Price        : {binance_prem.get('markPrice')}")
     print(f"Index Price       : {binance_prem.get('indexPrice')}")
 
-    # Calculate Basis (Mark Price - Spot Price)
-    d_mark = float(delta_ticker.get('mark_price', 0))
-    d_spot = float(delta_ticker.get('spot_price', 0))
+    if 'mark_price' not in delta_ticker or 'spot_price' not in delta_ticker:
+        raise KeyError(f"Delta missing mark_price or spot_price. Keys: {delta_ticker.keys()}")
+    d_mark = float(delta_ticker['mark_price'])
+    d_spot = float(delta_ticker['spot_price'])
     d_basis_bps = ((d_mark - d_spot) / d_spot) * 10000.0 if d_spot > 0 else 0.0
 
-    b_mark = float(binance_prem.get('markPrice', 0))
-    b_spot = float(binance_prem.get('indexPrice', 0))
+    if 'markPrice' not in binance_prem or 'indexPrice' not in binance_prem:
+        raise KeyError(f"Binance missing markPrice or indexPrice. Keys: {binance_prem.keys()}")
+    b_mark = float(binance_prem['markPrice'])
+    b_spot = float(binance_prem['indexPrice'])
     b_basis_bps = ((b_mark - b_spot) / b_spot) * 10000.0 if b_spot > 0 else 0.0
 
     print(f"\n--- BASIS (MARK - SPOT) ANALYSIS ---")

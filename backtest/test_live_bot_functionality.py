@@ -46,10 +46,11 @@ class TestLiveBotFunctionality(unittest.TestCase):
                 self.assertTrue(len(result) > 0, "Live ticker response must return active products")
                 ticker_map = {t['symbol']: t for t in result}
                 
-                # Check for PAXGUSD or XAUTUSD live price fields
-                if 'PAXGUSD' in ticker_map:
-                    paxg_close = float(ticker_map['PAXGUSD'].get('close', 0))
-                    self.assertGreater(paxg_close, 0.0, "PAXGUSD close price must be positive")
+                # Check for active products in ticker response
+                sample_sym = list(ticker_map.keys())[0] if ticker_map else None
+                if sample_sym:
+                    close_px = float(ticker_map[sample_sym].get('close', 0) or 0)
+                    self.assertGreater(close_px, 0.0, f"{sample_sym} close price must be positive")
         except Exception as e:
             self.skipTest(f"Live network endpoint unavailable: {e}")
 

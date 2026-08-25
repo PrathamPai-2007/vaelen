@@ -73,13 +73,18 @@ def run_options_diagnostics():
             
         sym = t.get('symbol')
         asset = t.get('underlying_asset_symbol')
-        strike = float(t.get('strike_price', 0))
+        if 'strike_price' not in t:
+            raise KeyError(f"Missing strike_price in ticker: {t.get('symbol')}")
+        strike = float(t['strike_price'])
         quotes = t.get('quotes', {})
         
+        if 'mark_price' not in t or 'spot_price' not in t:
+            raise KeyError(f"Missing mark_price or spot_price in ticker: {t.get('symbol')}")
+            
         best_bid = float(quotes.get('best_bid') or 0)
         best_ask = float(quotes.get('best_ask') or 0)
-        mark_px = float(t.get('mark_price') or 0)
-        spot_px = float(t.get('spot_price') or 0)
+        mark_px = float(t['mark_price'])
+        spot_px = float(t['spot_price'])
         mark_iv = float(t.get('mark_iv') or 0)
         
         # Parse expiry from symbol (e.g. C-BTC-65200-240726 -> 240726)

@@ -1,6 +1,22 @@
 use config::{Config, File};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bot_token: String,
+    #[serde(default)]
+    pub chat_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct NotificationsConfig {
+    #[serde(default)]
+    pub telegram: TelegramConfig,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub general: GeneralConfig,
@@ -10,57 +26,9 @@ pub struct AppConfig {
     pub strategy: StrategyConfig,
     pub session_tracking: SessionTrackingConfig,
     #[serde(default)]
-    pub macd_momentum: Option<MACDMomentumConfig>,
+    pub notifications: NotificationsConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct MACDMomentumConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_macd_fast")]
-    pub macd_fast: usize,
-    #[serde(default = "default_macd_slow")]
-    pub macd_slow: usize,
-    #[serde(default = "default_macd_signal")]
-    pub macd_signal: usize,
-    #[serde(default = "default_ema_filter")]
-    pub ema_filter: usize,
-    #[serde(default = "default_norm_threshold_pct")]
-    pub norm_threshold_pct: f64,
-    #[serde(default = "default_sl_atr_mult")]
-    pub sl_atr_mult: f64,
-    #[serde(default = "default_risk_reward_ratio")]
-    pub risk_reward_ratio: f64,
-    #[serde(default = "default_atr_period")]
-    pub atr_period: usize,
-    #[serde(default = "default_candle_interval_mins")]
-    pub candle_interval_mins: usize,
-    #[serde(default = "default_trend_filter_interval_mins")]
-    pub trend_filter_interval_mins: usize,
-    #[serde(default = "default_entry_cooldown_ticks")]
-    pub entry_cooldown_ticks: u64,
-    #[serde(default = "default_order_type")]
-    pub order_type: String,
-    #[serde(default = "default_max_hold_mins")]
-    pub max_hold_mins: usize,
-    #[serde(default = "default_true")]
-    pub scalper_offer_enabled: bool,
-}
-
-fn default_true() -> bool { true }
-fn default_macd_fast() -> usize { 12 }
-fn default_macd_slow() -> usize { 26 }
-fn default_macd_signal() -> usize { 9 }
-fn default_ema_filter() -> usize { 200 }
-fn default_norm_threshold_pct() -> f64 { 0.15 }
-fn default_sl_atr_mult() -> f64 { 1.5 }
-fn default_risk_reward_ratio() -> f64 { 1.5 }
-fn default_atr_period() -> usize { 14 }
-fn default_candle_interval_mins() -> usize { 5 }
-fn default_trend_filter_interval_mins() -> usize { 15 }
-fn default_entry_cooldown_ticks() -> u64 { 100 }
-fn default_order_type() -> String { "limit".to_string() }
-fn default_max_hold_mins() -> usize { 15 }
 fn default_strategy_type() -> String { "cvd_iceberg".to_string() }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -95,7 +63,11 @@ pub struct OrderManagerConfig {
     pub retry_on_status: Vec<u16>,
     pub track_fills: bool,
     pub fill_timeout_secs: u64,
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
 }
+
+fn default_max_consecutive_failures() -> u32 { 3 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FeesConfig {
@@ -141,24 +113,9 @@ pub struct SymbolConfig {
 
     #[serde(default = "default_strategy_type")]
     pub strategy_type: String,
+    
     #[serde(default)]
-    pub macd_fast: Option<usize>,
-    #[serde(default)]
-    pub macd_slow: Option<usize>,
-    #[serde(default)]
-    pub macd_signal: Option<usize>,
-    #[serde(default)]
-    pub ema_filter: Option<usize>,
-    #[serde(default)]
-    pub norm_threshold_pct: Option<f64>,
-    #[serde(default)]
-    pub sl_atr_mult: Option<f64>,
-    #[serde(default)]
-    pub risk_reward_ratio: Option<f64>,
-    #[serde(default)]
-    pub candle_interval_mins: Option<usize>,
-    #[serde(default)]
-    pub trend_filter_interval_mins: Option<usize>,
+    pub script_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -171,16 +128,123 @@ pub struct SessionTrackingConfig {
 }
 
 impl AppConfig {
-    pub fn load() -> Result<Self, config::ConfigError> {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.general.api_base_url.trim().is_empty() {
+            return Err("api_base_url cannot be empty".to_string());
+        }
+        if url::Url::parse(&self.general.api_base_url).is_err() {
+            return Err(format!("api_base_url '{}' is not a valid URL", self.general.api_base_url));
+        }
+
+        if self.fees.maker_fee_rate < 0.0 || self.fees.maker_fee_rate > 1.0 {
+            return Err("maker_fee_rate must be between 0 and 1".to_string());
+        }
+        if self.fees.taker_fee_rate < 0.0 || self.fees.taker_fee_rate > 1.0 {
+            return Err("taker_fee_rate must be between 0 and 1".to_string());
+        }
+
+        Ok(())
+    }
+
+    pub fn load() -> anyhow::Result<Self> {
+        Self::load_from_path("config")
+    }
+
+    pub fn load_from_path(path: &str) -> anyhow::Result<Self> {
         let builder = Config::builder()
-            .add_source(File::with_name("config").required(true))
+            .add_source(File::with_name(path).required(true))
             .add_source(config::Environment::with_prefix("DELTA").separator("__"))
             .build()?;
         
-        builder.try_deserialize()
+        let config: Self = builder.try_deserialize()?;
+        config.validate().map_err(|e| anyhow::anyhow!("Configuration validation failed: {}", e))?;
+        Ok(config)
     }
 }
 
-pub fn load_config() -> Result<AppConfig, config::ConfigError> {
+pub fn load_config() -> anyhow::Result<AppConfig> {
     AppConfig::load()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> AppConfig {
+        AppConfig {
+            general: GeneralConfig {
+                api_base_url: "https://api.delta.exchange".to_string(),
+                paper_trade_mode: true,
+                max_concurrent_positions: 1,
+                trade_channel_buffer: 1000,
+                trades_dir: "trades".to_string(),
+                log_level: "info".to_string(),
+                json_logs: false,
+                log_file: None,
+            },
+            websocket: WebSocketConfig {
+                ws_url: "wss://socket.delta.exchange".to_string(),
+                symbols: vec![],
+                ping_interval_secs: 30,
+                watchdog_timeout_secs: 10,
+                reconnect_base_secs: 1,
+                reconnect_max_secs: 30,
+                user_agent: "test".to_string(),
+            },
+            order_manager: OrderManagerConfig {
+                request_timeout_secs: 10,
+                max_retries: 3,
+                retry_base_delay_secs: 1,
+                retry_max_delay_secs: 30,
+                retry_on_status: vec![],
+                track_fills: false,
+                fill_timeout_secs: 10,
+                max_consecutive_failures: 3,
+            },
+            fees: FeesConfig {
+                taker_fee_rate: 0.0005,
+                maker_fee_rate: 0.0002,
+                slippage_bps: 2.0,
+            },
+            strategy: StrategyConfig { symbols: vec![] },
+            session_tracking: SessionTrackingConfig {
+                enabled: false,
+                risk_free_rate: 0.0,
+                equity_snapshot_interval: 60,
+                initial_equity: 1000.0,
+                estimated_ticks_per_day: 1000.0,
+            },
+        }
+    }
+
+    #[test]
+    fn test_valid_config_passes() {
+        let config = valid_config();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_url() {
+        let mut config = valid_config();
+        config.general.api_base_url = "not a url".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("not a valid URL"));
+
+        config.general.api_base_url = "".to_string();
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_invalid_fees() {
+        let mut config = valid_config();
+        config.fees.maker_fee_rate = 1.5;
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("maker_fee_rate must be between 0 and 1"));
+
+        let mut config2 = valid_config();
+        config2.fees.taker_fee_rate = -0.1;
+        let err = config2.validate().unwrap_err();
+        assert!(err.contains("taker_fee_rate must be between 0 and 1"));
+    }
 }
