@@ -7,7 +7,10 @@ pub struct TelegramNotifier;
 impl TelegramNotifier {
     pub fn spawn(token: String, chat_id: String) -> mpsc::Sender<String> {
         let (tx, mut rx) = mpsc::channel::<String>(100);
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new());
 
         tokio::spawn(async move {
             let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
@@ -18,8 +21,13 @@ impl TelegramNotifier {
                     "parse_mode": "HTML"
                 });
 
-                if let Err(e) = client.post(&url).json(&payload).send().await {
-                    error!("Failed to send Telegram alert: {}", e);
+                match client.post(&url).json(&payload).send().await {
+                    Ok(resp) => {
+                        if !resp.status().is_success() {
+                            error!("Telegram rejected alert: {}", resp.status());
+                        }
+                    }
+                    Err(e) => error!("Failed to send Telegram alert: {}", e),
                 }
             }
         });

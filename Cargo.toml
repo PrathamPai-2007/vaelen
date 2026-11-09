@@ -1,7 +1,8 @@
 [package]
 name = "delta_trading_engine"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
+rust-version = "1.75"
 default-run = "delta_trading_engine"
 
 [dependencies]

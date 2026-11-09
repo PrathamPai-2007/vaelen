@@ -21,7 +21,17 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = Arc::new(load_config()?);
+    let _ = dotenvy::dotenv();
+    // Optional first arg: config path without extension or with .toml
+    // (e.g. `engine config.live.toml`). Defaults to `config`.
+    let cfg_arg = std::env::args().nth(1);
+    let config = Arc::new(match cfg_arg.as_deref() {
+        Some(p) => {
+            let stem = p.strip_suffix(".toml").unwrap_or(p);
+            delta_trading_engine::config::AppConfig::load_from_path(stem)?
+        }
+        None => load_config()?,
+    });
 
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.general.log_level))
@@ -43,21 +53,23 @@ async fn main() -> anyhow::Result<()> {
         layers.push(fmt_layer.boxed());
     }
 
+    // Keep the non-blocking guard alive until shutdown or file logs are lost.
+    let mut _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
     if let Some(log_file) = &config.general.log_file {
         if let Some(parent) = std::path::Path::new(log_file).parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("failed to create log dir {:?}: {}", parent, e))?;
         }
-        let file_appender = tracing_appender::rolling::daily(
-            std::path::Path::new(log_file)
-                .parent()
-                .unwrap_or(std::path::Path::new(".")),
-            std::path::Path::new(log_file)
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap(),
-        );
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        let dir = std::path::Path::new(log_file)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let fname = std::path::Path::new(log_file)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow::anyhow!("log_file has non-UTF8 filename: {}", log_file))?;
+        let file_appender = tracing_appender::rolling::daily(dir, fname);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        _log_guard = Some(guard);
         let file_layer = fmt::layer()
             .with_writer(non_blocking)
             .with_ansi(false)
@@ -72,13 +84,28 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Delta Trading Engine...");
 
-    let api_key = std::env::var("DELTA_API_KEY").unwrap_or_else(|_| "dummy_api_key".to_string());
-    let api_secret =
-        std::env::var("DELTA_API_SECRET").unwrap_or_else(|_| "dummy_api_secret".to_string());
+    let api_key = std::env::var("DELTA_API_KEY").unwrap_or_default();
+    let api_secret = std::env::var("DELTA_API_SECRET").unwrap_or_default();
+    if !config.general.paper_trade_mode && (api_key.is_empty() || api_secret.is_empty()) {
+        anyhow::bail!(
+            "paper_trade_mode=false requires DELTA_API_KEY and DELTA_API_SECRET env vars"
+        );
+    }
+    let api_key = if api_key.is_empty() {
+        "dummy_api_key".to_string()
+    } else {
+        api_key
+    };
+    let api_secret = if api_secret.is_empty() {
+        "dummy_api_secret".to_string()
+    } else {
+        api_secret
+    };
 
     let (trade_tx, trade_rx) = mpsc::channel::<EngineMessage>(config.general.trade_channel_buffer);
     let (shutdown_tx, shutdown_rx1) = tokio::sync::broadcast::channel(SHUTDOWN_BROADCAST_CAPACITY);
     let shutdown_rx2 = shutdown_tx.subscribe();
+    let mut shutdown_rx3 = shutdown_tx.subscribe();
 
     let order_manager = Arc::new(OrderManager::new(
         api_key,
@@ -99,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     let telegram_tx = if config.notifications.telegram.enabled {
         Some(delta_trading_engine::telegram::TelegramNotifier::spawn(
             config.notifications.telegram.bot_token.clone(),
-            config.notifications.telegram.chat_id.clone()
+            config.notifications.telegram.chat_id.clone(),
         ))
     } else {
         None
@@ -117,7 +144,8 @@ async fn main() -> anyhow::Result<()> {
             strategy_config,
             shutdown_rx2,
             telegram_tx,
-        ).await;
+        )
+        .await;
     });
 
     let ingestion_config = config.clone();
@@ -129,24 +157,48 @@ async fn main() -> anyhow::Result<()> {
         let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         interval.tick().await;
         loop {
-            interval.tick().await;
-            info!(
-                "[HEARTBEAT] System alive - {}",
-                chrono::Local::now().format("%H:%M:%S")
-            );
+            tokio::select! {
+                _ = interval.tick() => info!(
+                    "[HEARTBEAT] System alive - {}",
+                    chrono::Utc::now().format("%H:%M:%S")
+                ),
+                _ = shutdown_rx3.recv() => break,
+            }
         }
     });
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("\nCTRL-C intercepted. Initiating graceful shutdown...");
-            let _ = shutdown_tx.send(());
+    // Windows service stop / Ctrl-C / Ctrl-Break all funnel into graceful shutdown.
+    #[cfg(windows)]
+    let shutdown_signal = async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = async {
+                let mut b = tokio::signal::windows::ctrl_break().expect("ctrl_break handler");
+                b.recv().await;
+            } => {},
         }
-    }
+    };
+    #[cfg(not(windows))]
+    let shutdown_signal = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    shutdown_signal.await;
+    info!("Shutdown requested. Initiating graceful shutdown...");
+    let _ = shutdown_tx.send(());
 
     info!("Waiting for worker tasks to complete...");
 
-    let _ = tokio::join!(ingestion_handle, strategy_handle, heartbeat_handle);
+    let (ing, strat, heart) = tokio::join!(ingestion_handle, strategy_handle, heartbeat_handle);
+    if let Err(e) = ing {
+        tracing::error!("ingestion task failed: {}", e);
+    }
+    if let Err(e) = strat {
+        tracing::error!("strategy task failed: {}", e);
+    }
+    if let Err(e) = heart {
+        tracing::error!("heartbeat task failed: {}", e);
+    }
+    drop(_log_guard);
 
     info!("System shutdown complete. All active feeds closed and queues finalized.");
     Ok(())

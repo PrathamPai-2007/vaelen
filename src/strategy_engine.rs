@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AppConfig, SymbolConfig};
+use crate::costs::{contracts_for_notional, leg_fee, leg_slippage, notional};
 use crate::orders::{OrderManager, OrderResult};
 use crate::session::{SessionTracker, TradeRecord};
 use crate::websocket::EngineMessage;
@@ -47,6 +48,8 @@ pub struct PendingPaperOrder {
     pub stop_loss_price: f64,
     pub take_profit_price: f64,
     pub ticks_held: usize,
+    /// Base-asset quantity ahead of us in the maker queue (decays as volume trades).
+    pub queue_ahead_base: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +137,7 @@ impl SymbolState {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -155,14 +159,20 @@ mod tests {
         update_candle_atr(&mut state, 102.0, 300, candle_mins, atr_period, tick_size);
         update_candle_atr(&mut state, 110.0, 400, candle_mins, atr_period, tick_size);
 
-        assert_eq!(state.curr_atr, 0.0, "ATR must be 0.0 until atr_period candles complete");
+        assert_eq!(
+            state.curr_atr, 0.0,
+            "ATR must be 0.0 until atr_period candles complete"
+        );
 
         // Candle 3 (ts 600..900): Starts at ts 600. Candle 2 completes (H=110, L=102, C=110, prev_close=98)
         // TR2 = max(110-102, |110-98|, |102-98|) = max(8, 12, 4) = 12.0
         // candle_tr_buffer = [7.0, 12.0]. Mean TR = 9.5
         update_candle_atr(&mut state, 108.0, 600, candle_mins, atr_period, tick_size);
 
-        assert!((state.curr_atr - 9.5).abs() < 1e-4, "Candle ATR must equal 9.5");
+        assert!(
+            (state.curr_atr - 9.5).abs() < 1e-4,
+            "Candle ATR must equal 9.5"
+        );
     }
 
     #[test]
@@ -178,7 +188,10 @@ mod tests {
         update_candle_atr(&mut state, 100.0, 600, candle_mins, atr_period, tick_size);
 
         // Mean TR is 0.0. Floor = max(0.1 * 5.0, 100.0 * 0.0005) = max(0.5, 0.05) = 0.5
-        assert!((state.curr_atr - 0.5).abs() < 1e-4, "ATR floor must prevent 0.0 ATR");
+        assert!(
+            (state.curr_atr - 0.5).abs() < 1e-4,
+            "ATR floor must prevent 0.0 ATR"
+        );
     }
 
     #[test]
@@ -192,23 +205,73 @@ mod tests {
             stop_loss_price: 95.0,
             take_profit_price: 105.0,
             ticks_held: 0,
+            queue_ahead_base: 0.0,
         });
 
         // Tick 1: Price touches 100.0 (not traded through yet) -> Should NOT fill
-        update_pending_paper_orders(&mut state, 100.0, 1001, 15);
-        assert_eq!(state.pending_paper_orders.len(), 1, "Pending order must remain when price only touches limit price");
-        assert_eq!(state.active_paper_trades.len(), 0, "Trade must NOT fill when price only touches limit price");
+        update_pending_paper_orders(&mut state, 100.0, 1001, 15, false, 1.0, 1.0);
+        assert_eq!(
+            state.pending_paper_orders.len(),
+            1,
+            "Pending order must remain when price only touches limit price"
+        );
+        assert_eq!(
+            state.active_paper_trades.len(),
+            0,
+            "Trade must NOT fill when price only touches limit price"
+        );
 
         // Tick 2: Price stays at 100.0 -> Should NOT fill
-        update_pending_paper_orders(&mut state, 100.0, 1002, 15);
-        assert_eq!(state.pending_paper_orders.len(), 1, "Pending order must remain");
+        update_pending_paper_orders(&mut state, 100.0, 1002, 15, false, 1.0, 1.0);
+        assert_eq!(
+            state.pending_paper_orders.len(),
+            1,
+            "Pending order must remain"
+        );
         assert_eq!(state.active_paper_trades.len(), 0, "Trade must NOT fill");
 
-        // Tick 3: Price drops to 99.5 (trades through long limit) -> Should FILL!
-        update_pending_paper_orders(&mut state, 99.5, 1003, 15);
-        assert_eq!(state.pending_paper_orders.len(), 0, "Pending order should be removed after fill");
-        assert_eq!(state.active_paper_trades.len(), 1, "Active paper trade must be created upon trade-through fill");
-        assert_eq!(state.active_paper_trades[0].entry_price, 100.0, "Entry price must equal limit price");
+        // Tick 3: sell aggressor trades through long limit -> Should FILL!
+        update_pending_paper_orders(&mut state, 99.5, 1003, 15, false, 1.0, 1.0);
+        assert_eq!(
+            state.pending_paper_orders.len(),
+            0,
+            "Pending order should be removed after fill"
+        );
+        assert_eq!(
+            state.active_paper_trades.len(),
+            1,
+            "Active paper trade must be created upon trade-through fill"
+        );
+        assert_eq!(
+            state.active_paper_trades[0].entry_price, 100.0,
+            "Entry price must equal limit price"
+        );
+    }
+
+    #[test]
+    fn test_maker_queue_needs_opposite_side_and_clears_queue() {
+        let mut state = SymbolState::new(100);
+        state.pending_paper_orders.push(PendingPaperOrder {
+            entry_time: 1,
+            limit_price: 100.0,
+            side: "buy".to_string(),
+            size: 2,
+            stop_loss_price: 95.0,
+            take_profit_price: 105.0,
+            ticks_held: 0,
+            queue_ahead_base: 5.0,
+        });
+        // Same-side buy tick through price must NOT fill and must NOT consume queue.
+        update_pending_paper_orders(&mut state, 99.0, 2, 15, true, 10.0, 1.0);
+        assert_eq!(state.active_paper_trades.len(), 0);
+        assert!((state.pending_paper_orders[0].queue_ahead_base - 5.0).abs() < 1e-9);
+        // Opposite-side sell tick consumes 1.0; 4.0 ahead remains.
+        update_pending_paper_orders(&mut state, 99.0, 3, 15, false, 1.0, 1.0);
+        assert_eq!(state.active_paper_trades.len(), 0);
+        assert!((state.pending_paper_orders[0].queue_ahead_base - 4.0).abs() < 1e-9);
+        // Next sell tick clears queue and has size -> fills.
+        update_pending_paper_orders(&mut state, 99.0, 4, 15, false, 4.0, 1.0);
+        assert_eq!(state.active_paper_trades.len(), 1);
     }
 }
 
@@ -235,26 +298,31 @@ pub fn update_candle_atr(
             state.curr_candle_close = price;
         }
         Some(start_ts) if bucket > start_ts => {
-            let high = state.curr_candle_high;
-            let low = state.curr_candle_low;
-            let close = state.curr_candle_close;
+            // Emit one TR per skipped candle (cap 10) so gaps don't collapse ATR.
+            let interval = interval_sec.max(1);
+            let mut skipped = ((bucket - start_ts) / interval) as usize;
+            skipped = skipped.clamp(1, 10);
+            for _ in 0..skipped {
+                let high = state.curr_candle_high;
+                let low = state.curr_candle_low;
 
-            let tr = match state.prev_candle_close {
-                Some(prev_close) => {
-                    let tr1 = high - low;
-                    let tr2 = (high - prev_close).abs();
-                    let tr3 = (low - prev_close).abs();
-                    tr1.max(tr2).max(tr3)
+                let tr = match state.prev_candle_close {
+                    Some(prev_close) => {
+                        let tr1 = high - low;
+                        let tr2 = (high - prev_close).abs();
+                        let tr3 = (low - prev_close).abs();
+                        tr1.max(tr2).max(tr3)
+                    }
+                    None => high - low,
+                };
+
+                state.candle_tr_buffer.push_back(tr);
+                if state.candle_tr_buffer.len() > 1000 {
+                    state.candle_tr_buffer.pop_front();
                 }
-                None => high - low,
-            };
 
-            state.candle_tr_buffer.push_back(tr);
-            if state.candle_tr_buffer.len() > 1000 {
-                state.candle_tr_buffer.pop_front();
+                state.prev_candle_close = Some(state.curr_candle_close);
             }
-
-            state.prev_candle_close = Some(close);
 
             state.curr_candle_start_ts = Some(bucket);
             state.curr_candle_high = price;
@@ -272,7 +340,7 @@ pub fn update_candle_atr(
         let len = state.candle_tr_buffer.len();
         let sum: f64 = state.candle_tr_buffer.iter().skip(len - atr_period).sum();
         let mean_tr = sum / (atr_period as f64);
-        
+
         let floor = (tick_size * 5.0).max(price * 0.0005);
         state.curr_atr = mean_tr.max(floor);
     } else {
@@ -284,17 +352,19 @@ pub fn compute_rolling_p95(buffer: &VecDeque<f64>) -> f64 {
     if buffer.len() < 10 {
         return f64::INFINITY;
     }
-    let mut sorted: Vec<f64> = buffer.iter().cloned().collect();
+    let mut sorted: Vec<f64> = buffer.iter().cloned().filter(|v| v.is_finite()).collect();
+    if sorted.len() < 10 {
+        return f64::INFINITY;
+    }
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = (sorted.len() as f64 * 0.95) as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    // Nearest-rank: ceil(0.95*n)-1
+    let idx = ((sorted.len() as f64 * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[idx]
 }
 
-pub fn update_1m_volume_p95(
-    state: &mut SymbolState,
-    size: f64,
-    trade_ts_sec: u64,
-) {
+pub fn update_1m_volume_p95(state: &mut SymbolState, size: f64, trade_ts_sec: u64) {
     let bucket_1m = (trade_ts_sec / 60) * 60;
     match state.current_1m_start_ts {
         None => {
@@ -302,9 +372,15 @@ pub fn update_1m_volume_p95(
             state.current_1m_vol = size;
         }
         Some(start_ts) if bucket_1m > start_ts => {
-            state.volume_buffer.push_back(state.current_1m_vol);
-            if state.volume_buffer.len() > 1000 {
-                state.volume_buffer.pop_front();
+            // Account for every skipped minute (cap 10) so volume isn't under-counted.
+            let mut skipped = ((bucket_1m - start_ts) / 60) as usize;
+            skipped = skipped.clamp(1, 10);
+            for i in 0..skipped {
+                let v = if i == 0 { state.current_1m_vol } else { 0.0 };
+                state.volume_buffer.push_back(v);
+                if state.volume_buffer.len() > 1000 {
+                    state.volume_buffer.pop_front();
+                }
             }
 
             state.p95_counter += 1;
@@ -326,11 +402,17 @@ pub fn update_1m_volume_p95(
     }
 }
 
+/// Restored maker queue: a pending buy (long entry) only fills when a SELL
+/// aggressor trades *through* the limit AND consumes the queue ahead of us.
+/// Same mirror for sells. This replaces the old instant-fill-at-touch model.
 pub fn update_pending_paper_orders(
     state: &mut SymbolState,
     price: f64,
     now_secs: u64,
     maker_timeout_ticks: usize,
+    tick_is_buy: bool,
+    tick_qty_base: f64,
+    contract_size: f64,
 ) {
     if state.pending_paper_orders.is_empty() {
         return;
@@ -341,11 +423,25 @@ pub fn update_pending_paper_orders(
         let p = &mut state.pending_paper_orders[i];
         p.ticks_held += 1;
 
-        let filled = if p.side == "buy" {
+        let is_buy_order = p.side.eq_ignore_ascii_case("buy");
+        // Opposite-side aggressor required for a maker fill.
+        let opposite_side = tick_is_buy != is_buy_order;
+        let through = if is_buy_order {
             price < p.limit_price
         } else {
             price > p.limit_price
         };
+        // Consume queue with opposite-side volume only.
+        if opposite_side && tick_qty_base > 0.0 {
+            p.queue_ahead_base = (p.queue_ahead_base - tick_qty_base).max(0.0);
+        }
+        let order_base = p.size as f64 * contract_size;
+        // Fill needs trade-through + queue cleared + enough size on this tick
+        // (at least half the order printed through us).
+        let filled = through
+            && opposite_side
+            && p.queue_ahead_base <= 0.0
+            && tick_qty_base >= order_base * 0.5;
 
         if filled {
             let order = state.pending_paper_orders.remove(i);
@@ -389,7 +485,10 @@ pub async fn run_strategy_engine(
         if let Some(script_path) = &sym_cfg.script_path {
             match crate::scripting::VaelenScriptEngine::new(script_path) {
                 Ok(engine) => {
-                    info!("Loaded script for symbol {}: {}", sym_cfg.symbol, script_path);
+                    info!(
+                        "Loaded script for symbol {}: {}",
+                        sym_cfg.symbol, script_path
+                    );
                     scripts.insert(sym_cfg.symbol.clone(), Some(engine));
                 }
                 Err(e) => {
@@ -403,15 +502,19 @@ pub async fn run_strategy_engine(
     }
 
     let paper_trade_mode = config.general.paper_trade_mode;
-    let taker_fee_rate = config.fees.taker_fee_rate;
     let slippage_bps = config.fees.slippage_bps;
     let max_concurrent_positions = config.general.max_concurrent_positions;
 
-    std::fs::create_dir_all(&config.general.trades_dir).ok();
+    if let Err(e) = std::fs::create_dir_all(&config.general.trades_dir) {
+        error!(
+            "failed to create trades_dir {}: {}",
+            config.general.trades_dir, e
+        );
+    }
     let session_filename = format!(
         "{}/{}.csv",
         config.general.trades_dir,
-        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+        chrono::Utc::now().format("%Y-%m-%d_%H-%M-%S")
     );
     let mut csv_writer = OpenOptions::new()
         .create(true)
@@ -427,7 +530,12 @@ pub async fn run_strategy_engine(
     info!(
         "Strategy engine initialized. Paper Trading: {}. Symbols: {:?}",
         paper_trade_mode,
-        config.strategy.symbols.iter().map(|c| &c.symbol).collect::<Vec<_>>()
+        config
+            .strategy
+            .symbols
+            .iter()
+            .map(|c| &c.symbol)
+            .collect::<Vec<_>>()
     );
 
     let mut feed_is_stale = false;
@@ -486,9 +594,27 @@ pub async fn run_strategy_engine(
         let symbol = trade.symbol.clone();
         let symbol_config = match config_map.get(&symbol) {
             Some(c) => c.clone(),
-            None => continue,
+            None => {
+                warn!(
+                    "unknown symbol {} from feed; skipping (check WS vs strategy symbols)",
+                    symbol
+                );
+                continue;
+            }
         };
 
+        // Global cap: count other symbols before taking the mutable borrow.
+        let others_count: usize = states
+            .iter()
+            .filter(|(k, _)| *k != &symbol)
+            .map(|(_, s)| {
+                if paper_trade_mode {
+                    s.active_paper_trades.len() + s.pending_paper_orders.len()
+                } else {
+                    s.active_live_trades.len()
+                }
+            })
+            .sum();
         let state = states
             .entry(symbol.clone())
             .or_insert_with(|| SymbolState::new(symbol_config.max_capacity));
@@ -501,13 +627,8 @@ pub async fn run_strategy_engine(
             continue;
         }
 
-        state.price_queue.push_back(price);
-        if state.price_queue.len() > symbol_config.max_capacity {
-            state.price_queue.pop_front();
-        }
-
         state.total_ticks += 1;
-        if state.total_ticks.is_multiple_of(HEARTBEAT_TICK_INTERVAL) {
+        if state.total_ticks % HEARTBEAT_TICK_INTERVAL == 0 {
             let active_count = if paper_trade_mode {
                 state.active_paper_trades.len()
             } else {
@@ -531,13 +652,14 @@ pub async fn run_strategy_engine(
             state,
             price,
             now_secs,
-            5,
+            symbol_config.candle_mins as usize,
             symbol_config.atr_period,
             symbol_config.tick_size,
         );
         update_1m_volume_p95(state, size, now_secs);
         let atr = state.curr_atr;
         let mut newly_filled_entries = Vec::new();
+        let mut filled_tp_orders: Vec<ActiveOrder> = Vec::new();
         if !paper_trade_mode {
             let mut i = 0;
             while i < state.active_orders.len() {
@@ -564,6 +686,8 @@ pub async fn run_strategy_engine(
                             );
                             if order.kind == "Entry" {
                                 newly_filled_entries.push((order.clone(), fill));
+                            } else if order.kind == "TP" {
+                                filled_tp_orders.push(order.clone());
                             }
                             state.active_orders.remove(i);
                             continue;
@@ -582,6 +706,48 @@ pub async fn run_strategy_engine(
                     }
                 }
                 i += 1;
+            }
+            // TP filled -> close one linked live trade as TAKE-PROFIT (FIFO).
+            for tp in filled_tp_orders.drain(..) {
+                if let Some(pos) = state
+                    .active_live_trades
+                    .iter()
+                    .position(|t| t.size == tp.size)
+                {
+                    let t = state.active_live_trades.remove(pos);
+                    let ntl = notional(tp.price, symbol_config.contract_size, t.size);
+                    let fees = leg_fee(
+                        notional(t.entry_price, symbol_config.contract_size, t.size),
+                        false,
+                    ) + leg_fee(ntl, true);
+                    let slip = leg_slippage(
+                        tp.price,
+                        symbol_config.contract_size,
+                        t.size,
+                        symbol_config.tick_size,
+                        0.0,
+                    );
+                    let gross = if t.side == "buy" {
+                        (tp.price - t.entry_price) * t.size as f64 * symbol_config.contract_size
+                    } else {
+                        (t.entry_price - tp.price) * t.size as f64 * symbol_config.contract_size
+                    };
+                    session_tracker.write().record_trade(TradeRecord {
+                        symbol: symbol.clone(),
+                        entry_time: t.entry_time,
+                        side: t.side,
+                        entry_price: t.entry_price,
+                        exit_price: tp.price,
+                        exit_reason: "TAKE-PROFIT".to_string(),
+                        gross_pnl: gross,
+                        fees,
+                        slippage: slip,
+                        net_pnl: gross - fees - slip,
+                        size: t.size,
+                        contract_size: symbol_config.contract_size,
+                    });
+                    info!("[{}] TP filled; closed linked position", symbol);
+                }
             }
         }
 
@@ -626,9 +792,11 @@ pub async fn run_strategy_engine(
                 )
                 .await
             {
-                Ok(OrderResult::Open(tp_fill)
-                | OrderResult::Partial(tp_fill)
-                | OrderResult::Filled(tp_fill)) => {
+                Ok(
+                    OrderResult::Open(tp_fill)
+                    | OrderResult::Partial(tp_fill)
+                    | OrderResult::Filled(tp_fill),
+                ) => {
                     state.active_orders.push(ActiveOrder {
                         id: tp_fill.order_id,
                         price: tp_price,
@@ -701,21 +869,27 @@ pub async fn run_strategy_engine(
             });
 
             for t in completed {
-                let size_btc = t.size as f64 * symbol_config.contract_size;
-                let entry_fee = t.entry_price * taker_fee_rate * size_btc;
-                let exit_fee = price * taker_fee_rate * size_btc;
-                let trade_fees = entry_fee + exit_fee;
-                let trade_slippage = price * (slippage_bps / BASIS_POINTS_DENOMINATOR) * size_btc;
+                let entry_ntl = notional(t.entry_price, symbol_config.contract_size, t.size);
+                let exit_ntl = notional(price, symbol_config.contract_size, t.size);
+                // Maker entry + maker TP assumed; SL/timeout legs pay taker in live.
+                // Paper uses maker/maker as optimistic bound now that queue is modeled.
+                let trade_fees = leg_fee(entry_ntl, true) + leg_fee(exit_ntl, true);
+                let trade_slippage = leg_slippage(
+                    price,
+                    symbol_config.contract_size,
+                    t.size,
+                    symbol_config.tick_size,
+                    slippage_bps,
+                );
                 let raw_gross_pnl = if t.side == "buy" {
-                    (price - t.entry_price) * size_btc
+                    (price - t.entry_price) * t.size as f64 * symbol_config.contract_size
                 } else {
-                    (t.entry_price - price) * size_btc
+                    (t.entry_price - price) * t.size as f64 * symbol_config.contract_size
                 };
                 let net_pnl = raw_gross_pnl - trade_fees - trade_slippage;
 
-                let ts_dist = (symbol_config.trailing_stop_atr_mult
-                    * state.curr_atr)
-                .max(symbol_config.min_trailing_stop_distance);
+                let ts_dist = (symbol_config.trailing_stop_atr_mult * state.curr_atr)
+                    .max(symbol_config.min_trailing_stop_distance);
                 let ts_activated = if t.side == "buy" {
                     t.highest_price - t.entry_price > ts_dist
                 } else {
@@ -736,9 +910,8 @@ pub async fn run_strategy_engine(
                 } else {
                     price >= t.stop_loss_price
                 };
-                let exit_reason = if t.ticks_elapsed >= symbol_config.hold_ticks {
-                    "TIMEOUT"
-                } else if hit_sl {
+                // Priority: STOP-LOSS > TAKE-PROFIT > TRAILING-STOP > TIMEOUT
+                let exit_reason = if hit_sl {
                     "STOP-LOSS"
                 } else if hit_tp {
                     "TAKE-PROFIT"
@@ -766,7 +939,7 @@ pub async fn run_strategy_engine(
                     contract_size: symbol_config.contract_size,
                 };
                 if let Some(tx) = &telegram_tx {
-                    let icon = if record.net_pnl > 0.0 { "?" } else { "?" };
+                    let icon = if record.net_pnl > 0.0 { "+" } else { "-" };
                     let msg = format!("{} <b>POSITION CLOSED</b> | {}\nExit Reason: {}\nEntry: {:.5}\nExit: {:.5}\nNet PnL: {:.5} USD", icon, record.symbol, record.exit_reason, record.entry_price, record.exit_price, record.net_pnl);
                     let _ = tx.try_send(msg);
                 }
@@ -791,7 +964,11 @@ pub async fn run_strategy_engine(
                     net_pnl
                 );
                 if let Some(ref mut writer) = csv_writer {
-                    let _ = writer.write_all(log_line.as_bytes());
+                    if writer.write_all(log_line.as_bytes()).is_err() {
+                        error!("failed to journal paper trade");
+                    } else if state.total_ticks % 50 == 0 {
+                        let _ = writer.flush();
+                    }
                 }
             }
         } else {
@@ -832,6 +1009,19 @@ pub async fn run_strategy_engine(
             });
 
             for mut t in completed {
+                // Cancel any resting TP for this symbol so we don't double-close.
+                let tp_ids: Vec<String> = state
+                    .active_orders
+                    .iter()
+                    .filter(|o| o.kind == "TP")
+                    .map(|o| o.id.clone())
+                    .collect();
+                if !tp_ids.is_empty() {
+                    order_manager
+                        .cancel_all_for_product(symbol_config.product_id, &tp_ids)
+                        .await;
+                    state.active_orders.retain(|o| o.kind != "TP");
+                }
                 let close_side = if t.side == "buy" { "sell" } else { "buy" };
 
                 let hit_sl = if t.side == "buy" {
@@ -878,11 +1068,18 @@ pub async fn run_strategy_engine(
 
                 let fill_price = match order_result {
                     OrderResult::Filled(fill) => {
+                        if fill.filled_size != 0 && fill.filled_size != t.size {
+                            warn!("[{}] close fill size {} != position {}; resizing TP already cancelled", symbol, fill.filled_size, t.size);
+                            t.size = fill.filled_size;
+                        }
                         t.fill_price = Some(fill.price);
                         fill.price
                     }
                     OrderResult::Partial(fill) => {
                         warn!("[{}] Partial fill for close order: {:?}", symbol, fill);
+                        if fill.filled_size != 0 {
+                            t.size = fill.filled_size;
+                        }
                         t.fill_price = Some(fill.price);
                         fill.price
                     }
@@ -902,23 +1099,30 @@ pub async fn run_strategy_engine(
                     }
                 };
 
-                let size_btc = t.size as f64 * symbol_config.contract_size;
                 let entry_price = t.fill_price.unwrap_or(t.entry_price);
-                let entry_fee = entry_price * taker_fee_rate * size_btc;
-                let exit_fee = fill_price * taker_fee_rate * size_btc;
-                let trade_fees = entry_fee + exit_fee;
-                let trade_slippage =
-                    fill_price * (slippage_bps / BASIS_POINTS_DENOMINATOR) * size_btc;
+                let trade_fees = leg_fee(
+                    notional(entry_price, symbol_config.contract_size, t.size),
+                    false,
+                ) + leg_fee(
+                    notional(fill_price, symbol_config.contract_size, t.size),
+                    false,
+                );
+                let trade_slippage = leg_slippage(
+                    fill_price,
+                    symbol_config.contract_size,
+                    t.size,
+                    symbol_config.tick_size,
+                    slippage_bps,
+                );
                 let raw_gross_pnl = if t.side == "buy" {
-                    (fill_price - entry_price) * size_btc
+                    (fill_price - entry_price) * t.size as f64 * symbol_config.contract_size
                 } else {
-                    (entry_price - fill_price) * size_btc
+                    (entry_price - fill_price) * t.size as f64 * symbol_config.contract_size
                 };
                 let net_pnl = raw_gross_pnl - trade_fees - trade_slippage;
 
-                let ts_dist = (symbol_config.trailing_stop_atr_mult
-                    * state.curr_atr)
-                .max(symbol_config.min_trailing_stop_distance);
+                let ts_dist = (symbol_config.trailing_stop_atr_mult * state.curr_atr)
+                    .max(symbol_config.min_trailing_stop_distance);
                 let ts_activated = if t.side == "buy" {
                     t.highest_price - t.entry_price > ts_dist
                 } else {
@@ -934,9 +1138,7 @@ pub async fn run_strategy_engine(
                 } else {
                     fill_price >= t.stop_loss_price
                 };
-                let exit_reason = if t.ticks_elapsed >= symbol_config.hold_ticks {
-                    "TIMEOUT"
-                } else if hit_sl {
+                let exit_reason = if hit_sl {
                     "STOP-LOSS"
                 } else if ts_activated
                     && ((t.side == "buy" && fill_price <= ts_price)
@@ -962,7 +1164,7 @@ pub async fn run_strategy_engine(
                     contract_size: symbol_config.contract_size,
                 };
                 if let Some(tx) = &telegram_tx {
-                    let icon = if record.net_pnl > 0.0 { "?" } else { "?" };
+                    let icon = if record.net_pnl > 0.0 { "+" } else { "-" };
                     let msg = format!("{} <b>POSITION CLOSED</b> | {}\nExit Reason: {}\nEntry: {:.5}\nExit: {:.5}\nNet PnL: {:.5} USD", icon, record.symbol, record.exit_reason, record.entry_price, record.exit_price, record.net_pnl);
                     let _ = tx.try_send(msg);
                 }
@@ -1007,8 +1209,11 @@ pub async fn run_strategy_engine(
                 }
             }
         }
-        state.rolling_volume_sum += size - outgoing_size;
-        state.rolling_volume_sq_sum += size * size - outgoing_size_sq;
+        state.rolling_volume_sum = (state.rolling_volume_sum + size - outgoing_size).max(0.0);
+        state.rolling_volume_sq_sum =
+            (state.rolling_volume_sq_sum + size * size - outgoing_size_sq).max(0.0);
+        state.rolling_buy_volume = state.rolling_buy_volume.max(0.0);
+        state.rolling_sell_volume = state.rolling_sell_volume.max(0.0);
 
         let side_val = if trade.side.eq_ignore_ascii_case("buy") {
             1.0
@@ -1039,26 +1244,28 @@ pub async fn run_strategy_engine(
         state.size_queue.push_back(size);
         state.side_queue.push_back(side_val);
 
-        update_candle_atr(
-            state,
-            price,
-            now_secs,
-            5,
-            symbol_config.atr_period,
-            symbol_config.tick_size,
-        );
-        update_1m_volume_p95(state, size, now_secs);
-        let atr = state.curr_atr;
-
+        let tick_is_buy = trade.side.eq_ignore_ascii_case("buy");
         if paper_trade_mode {
-            update_pending_paper_orders(state, price, now_secs, 15);
+            update_pending_paper_orders(
+                state,
+                price,
+                now_secs,
+                15,
+                tick_is_buy,
+                size,
+                symbol_config.contract_size,
+            );
         }
 
-        let active_count = if paper_trade_mode {
-            state.active_paper_trades.len() + state.pending_paper_orders.len()
-        } else {
-            state.active_live_trades.len()
-        };
+        session_tracker.write().tick();
+
+        // Global cap across all symbols (not per-symbol).
+        let active_count: usize = others_count
+            + if paper_trade_mode {
+                state.active_paper_trades.len() + state.pending_paper_orders.len()
+            } else {
+                state.active_live_trades.len()
+            };
 
         let current_len = state.price_queue.len();
         let mut script_buy = false;
@@ -1066,11 +1273,14 @@ pub async fn run_strategy_engine(
         let past_index = current_len.saturating_sub(1 + symbol_config.lookback_ticks);
         let mut past_price_val = 0.0;
         let mut past_cvd_val = 0.0;
-        if let (Some(&p), Some(&c)) = (state.price_queue.get(past_index), state.cvd_queue.get(past_index)) {
+        if let (Some(&p), Some(&c)) = (
+            state.price_queue.get(past_index),
+            state.cvd_queue.get(past_index),
+        ) {
             past_price_val = p;
             past_cvd_val = c;
         }
-        let is_buy = trade.side == "buy";
+        let is_buy = trade.side.eq_ignore_ascii_case("buy");
         if let Some(Some(script_engine)) = scripts.get(&symbol) {
             if current_len > symbol_config.lookback_ticks {
                 let mut script_ctx = crate::scripting::ScriptContext {
@@ -1091,8 +1301,12 @@ pub async fn run_strategy_engine(
                 if let Err(e) = script_engine.execute_on_tick(&mut script_ctx) {
                     error!("Script execution error on {}: {}", symbol, e);
                 }
-                script_buy = script_ctx.should_buy;
-                script_sell = script_ctx.should_sell;
+                if script_ctx.should_buy && script_ctx.should_sell {
+                    warn!("[{}] script set both buy+sell; ignoring signal", symbol);
+                } else {
+                    script_buy = script_ctx.should_buy;
+                    script_sell = script_ctx.should_sell;
+                }
             }
         }
 
@@ -1100,12 +1314,27 @@ pub async fn run_strategy_engine(
         let mut want_sell = script_sell;
         let delta_price = price - past_price_val;
         let cum_taker_volume = state.rolling_volume_sum;
-        let price_impact = if cum_taker_volume > 0.0 { delta_price.abs() / cum_taker_volume } else { 0.0 };
-        
-        if !script_buy && !script_sell && symbol_config.strategy_type == "cvd_iceberg" && current_len > symbol_config.lookback_ticks {
+        // Notional (USD) over the lookback window for the min-volume gate.
+        let cum_notional = cum_taker_volume * price * symbol_config.contract_size;
+        let price_impact = if cum_taker_volume > 0.0 {
+            delta_price.abs() / cum_taker_volume
+        } else {
+            0.0
+        };
+
+        if !script_buy
+            && !script_sell
+            && symbol_config.strategy_type == "cvd_iceberg"
+            && current_len > symbol_config.lookback_ticks
+        {
             let volume_spike = size > state.cached_p95_volume;
-            let cooldown_elapsed = state.total_ticks.saturating_sub(state.last_entry_tick) >= symbol_config.entry_cooldown_ticks;
-            let can_absorb = !feed_is_stale && volume_spike && cum_taker_volume > symbol_config.min_cvd_notional_usd && price_impact < symbol_config.max_price_impact_threshold && cooldown_elapsed;
+            let cooldown_elapsed = state.total_ticks.saturating_sub(state.last_entry_tick)
+                >= symbol_config.entry_cooldown_ticks;
+            let can_absorb = !feed_is_stale
+                && volume_spike
+                && cum_notional > symbol_config.min_cvd_notional_usd
+                && price_impact < symbol_config.max_price_impact_threshold
+                && cooldown_elapsed;
             if can_absorb {
                 if state.current_cvd > past_cvd_val && delta_price <= 0.0 {
                     want_sell = true;
@@ -1117,14 +1346,30 @@ pub async fn run_strategy_engine(
 
         if (want_buy || want_sell) && !feed_is_stale {
             if active_count >= max_concurrent_positions {
-                debug!("[{}] Signal ignored: max positions ({}) reached.", symbol, max_concurrent_positions);
+                debug!(
+                    "[{}] Signal ignored: max positions ({}) reached.",
+                    symbol, max_concurrent_positions
+                );
             } else {
                 let side_str = if want_buy { "buy" } else { "sell" };
                 info!("[{}] Strategy Signal {} @ {}, Delta Px: {:.5}, Cum Vol: {:.2}, Impact: {:.2e}, ATR: {:.5}", symbol, side_str, price, delta_price, cum_taker_volume, price_impact, atr);
-                let order_size = symbol_config.order_size;
+                // Fixed-notional sizing ($2k default) instead of static dust lots.
+                let order_size = contracts_for_notional(
+                    price,
+                    symbol_config.contract_size,
+                    symbol_config.target_notional_usd,
+                )
+                .max(symbol_config.order_size);
                 if let Some(tx) = &telegram_tx {
                     let mode = if paper_trade_mode { "PAPER" } else { "LIVE" };
-                    let msg = format!("?? <b>ENTRY {}</b> | {} ({})\nPrice: {:.5}\nSize: {}", side_str.to_uppercase(), symbol, mode, price, order_size);
+                    let msg = format!(
+                        "[ENTRY {}] | {} ({}) | Price: {:.5} | Size: {}",
+                        side_str.to_uppercase(),
+                        symbol,
+                        mode,
+                        price,
+                        order_size
+                    );
                     let _ = tx.try_send(msg);
                 }
                 let tp_mult = symbol_config.take_profit_bps / 10000.0;
@@ -1136,16 +1381,17 @@ pub async fn run_strategy_engine(
                 };
                 let now = now_secs;
                 if paper_trade_mode {
-                    state.active_paper_trades.push(PaperTrade {
+                    // Maker queue: queue ahead = one order's base qty (conservative).
+                    let order_base = order_size as f64 * symbol_config.contract_size;
+                    state.pending_paper_orders.push(PendingPaperOrder {
                         entry_time: now,
-                        entry_price: price,
+                        limit_price: price,
                         side: side_str.to_string(),
                         size: order_size,
-                        ticks_elapsed: 0,
-                        highest_price: price,
-                        lowest_price: price,
                         stop_loss_price,
                         take_profit_price,
+                        ticks_held: 0,
+                        queue_ahead_base: order_base,
                     });
                 } else {
                     let order_result = order_manager
@@ -1163,7 +1409,9 @@ pub async fn run_strategy_engine(
                         .await;
 
                     match order_result {
-                        OrderResult::Open(fill) | OrderResult::Partial(fill) | OrderResult::Filled(fill) => {
+                        OrderResult::Open(fill)
+                        | OrderResult::Partial(fill)
+                        | OrderResult::Filled(fill) => {
                             state.active_orders.push(ActiveOrder {
                                 id: fill.order_id,
                                 price,
@@ -1184,19 +1432,39 @@ pub async fn run_strategy_engine(
 
     for (symbol, mut state) in states {
         if let Some(&last_price) = state.price_queue.back() {
-            let symbol_config = config_map.get(&symbol).unwrap();
+            let Some(symbol_config) = config_map.get(&symbol).cloned() else {
+                continue;
+            };
+            // Drop unfilled maker queue as CANCELLED (never entered).
+            state.pending_paper_orders.clear();
+            // Cancel resting exchange orders before force-closing.
+            if !paper_trade_mode && !state.active_orders.is_empty() {
+                let ids: Vec<String> = state.active_orders.iter().map(|o| o.id.clone()).collect();
+                order_manager
+                    .cancel_all_for_product(symbol_config.product_id, &ids)
+                    .await;
+                state.active_orders.clear();
+            }
             if paper_trade_mode {
                 for t in state.active_paper_trades.drain(..) {
-                    let size_btc = t.size as f64 * symbol_config.contract_size;
-                    let entry_fee = t.entry_price * taker_fee_rate * size_btc;
-                    let exit_fee = last_price * taker_fee_rate * size_btc;
-                    let trade_fees = entry_fee + exit_fee;
-                    let trade_slippage =
-                        last_price * (slippage_bps / BASIS_POINTS_DENOMINATOR) * size_btc;
+                    let trade_fees = leg_fee(
+                        notional(t.entry_price, symbol_config.contract_size, t.size),
+                        true,
+                    ) + leg_fee(
+                        notional(last_price, symbol_config.contract_size, t.size),
+                        true,
+                    );
+                    let trade_slippage = leg_slippage(
+                        last_price,
+                        symbol_config.contract_size,
+                        t.size,
+                        symbol_config.tick_size,
+                        slippage_bps,
+                    );
                     let raw_gross_pnl = if t.side == "buy" {
-                        (last_price - t.entry_price) * size_btc
+                        (last_price - t.entry_price) * t.size as f64 * symbol_config.contract_size
                     } else {
-                        (t.entry_price - last_price) * size_btc
+                        (t.entry_price - last_price) * t.size as f64 * symbol_config.contract_size
                     };
                     let net_pnl = raw_gross_pnl - trade_fees - trade_slippage;
 
@@ -1215,7 +1483,7 @@ pub async fn run_strategy_engine(
                         contract_size: symbol_config.contract_size,
                     };
                     if let Some(tx) = &telegram_tx {
-                        let icon = if record.net_pnl > 0.0 { "?" } else { "?" };
+                        let icon = if record.net_pnl > 0.0 { "+" } else { "-" };
                         let msg = format!("{} <b>POSITION CLOSED</b> | {}\nExit Reason: {}\nEntry: {:.5}\nExit: {:.5}\nNet PnL: {:.5} USD", icon, record.symbol, record.exit_reason, record.entry_price, record.exit_price, record.net_pnl);
                         let _ = tx.try_send(msg);
                     }
@@ -1320,17 +1588,25 @@ pub async fn run_strategy_engine(
                         }
                     };
 
-                    let size_btc = t.size as f64 * symbol_config.contract_size;
                     let entry_price = t.fill_price.unwrap_or(t.entry_price);
-                    let entry_fee = entry_price * taker_fee_rate * size_btc;
-                    let exit_fee = fill_price * taker_fee_rate * size_btc;
-                    let trade_fees = entry_fee + exit_fee;
-                    let trade_slippage =
-                        fill_price * (slippage_bps / BASIS_POINTS_DENOMINATOR) * size_btc;
+                    let trade_fees = leg_fee(
+                        notional(entry_price, symbol_config.contract_size, t.size),
+                        false,
+                    ) + leg_fee(
+                        notional(fill_price, symbol_config.contract_size, t.size),
+                        false,
+                    );
+                    let trade_slippage = leg_slippage(
+                        fill_price,
+                        symbol_config.contract_size,
+                        t.size,
+                        symbol_config.tick_size,
+                        slippage_bps,
+                    );
                     let raw_gross_pnl = if t.side == "buy" {
-                        (fill_price - entry_price) * size_btc
+                        (fill_price - entry_price) * t.size as f64 * symbol_config.contract_size
                     } else {
-                        (entry_price - fill_price) * size_btc
+                        (entry_price - fill_price) * t.size as f64 * symbol_config.contract_size
                     };
                     let net_pnl = raw_gross_pnl - trade_fees - trade_slippage;
 
@@ -1349,7 +1625,7 @@ pub async fn run_strategy_engine(
                         contract_size: symbol_config.contract_size,
                     };
                     if let Some(tx) = &telegram_tx {
-                        let icon = if record.net_pnl > 0.0 { "?" } else { "?" };
+                        let icon = if record.net_pnl > 0.0 { "+" } else { "-" };
                         let msg = format!("{} <b>POSITION CLOSED</b> | {}\nExit Reason: {}\nEntry: {:.5}\nExit: {:.5}\nNet PnL: {:.5} USD", icon, record.symbol, record.exit_reason, record.entry_price, record.exit_price, record.net_pnl);
                         let _ = tx.try_send(msg);
                     }

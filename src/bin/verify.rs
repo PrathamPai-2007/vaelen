@@ -14,8 +14,8 @@ fn generate_signature(
     payload_str: &str,
 ) -> String {
     let signature_data = format!("{}{}{}{}", method, timestamp, path, payload_str);
-    let mut mac = HmacSha256::new_from_slice(api_secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(api_secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(signature_data.as_bytes());
     let result = mac.finalize();
     let code_bytes = result.into_bytes();
@@ -76,13 +76,19 @@ async fn main() {
     match res {
         Ok(response) => {
             let status = response.status();
-            let body = response.text().await.unwrap_or_else(|_| "Failed to read body".to_string());
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Failed to read body".to_string());
             println!("Status Code: {}", status);
             println!("Response Body: {}", body);
             if status.is_success() {
                 println!("\nSUCCESS: API keys are valid and working!");
             } else {
-                println!("\nFAILURE: API keys verification failed. Response: {}", body);
+                println!(
+                    "\nFAILURE: API keys verification failed. Response: {}",
+                    body
+                );
             }
         }
         Err(e) => {

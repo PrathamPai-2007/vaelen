@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::collections::VecDeque;
@@ -27,7 +27,7 @@ pub struct TradeRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquitySnapshot {
     #[serde_as(as = "DisplayFromStr")]
-    pub timestamp: DateTime<Local>,
+    pub timestamp: DateTime<Utc>,
     pub equity: f64,
     pub drawdown: f64,
     pub peak_equity: f64,
@@ -55,7 +55,13 @@ pub struct SessionTracker {
 }
 
 impl SessionTracker {
-    pub fn new(enabled: bool, risk_free_rate: f64, equity_snapshot_interval: usize, initial_equity: f64, ticks_per_day_estimate: f64) -> Self {
+    pub fn new(
+        enabled: bool,
+        risk_free_rate: f64,
+        equity_snapshot_interval: usize,
+        initial_equity: f64,
+        ticks_per_day_estimate: f64,
+    ) -> Self {
         Self {
             trades: Vec::new(),
             equity_curve: VecDeque::with_capacity(EQUITY_CURVE_CAPACITY),
@@ -83,6 +89,11 @@ impl SessionTracker {
             return;
         }
 
+        self.tick_counter = self.tick_counter.saturating_add(1);
+        // Bound memory for long-lived HFT sessions; CSV journal is source of truth.
+        if self.trades.len() >= 100_000 {
+            self.trades.drain(0..10_000);
+        }
         self.trades.push(trade.clone());
         self.total_gross_pnl += trade.gross_pnl;
         self.total_fees += trade.fees;
@@ -107,8 +118,7 @@ impl SessionTracker {
     }
 
     fn update_equity_snapshot(&mut self) {
-        self.tick_counter += 1;
-        if !self.tick_counter.is_multiple_of(self.equity_snapshot_interval) {
+        if self.tick_counter % self.equity_snapshot_interval != 0 {
             return;
         }
 
@@ -128,7 +138,7 @@ impl SessionTracker {
         }
 
         self.equity_curve.push_back(EquitySnapshot {
-            timestamp: Local::now(),
+            timestamp: Utc::now(),
             equity: current_equity,
             drawdown,
             peak_equity: self.peak_equity,
@@ -143,6 +153,7 @@ impl SessionTracker {
         if !self.enabled {
             return;
         }
+        self.tick_counter = self.tick_counter.saturating_add(1);
         self.update_equity_snapshot();
     }
 
@@ -151,7 +162,8 @@ impl SessionTracker {
             return None;
         }
 
-        let returns: Vec<f64> = self.equity_curve
+        let returns: Vec<f64> = self
+            .equity_curve
             .iter()
             .zip(self.equity_curve.iter().skip(1))
             .map(|(prev, curr)| {
@@ -168,9 +180,11 @@ impl SessionTracker {
         }
 
         let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter()
+        let variance = returns
+            .iter()
             .map(|r| (r - mean_return).powi(2))
-            .sum::<f64>() / returns.len() as f64;
+            .sum::<f64>()
+            / returns.len() as f64;
         let std_dev = variance.sqrt();
 
         if std_dev == 0.0 {
@@ -179,7 +193,8 @@ impl SessionTracker {
 
         let snapshots_per_day = self.ticks_per_day_estimate / self.equity_snapshot_interval as f64;
         let annualization_factor = (TRADING_DAYS_PER_YEAR * snapshots_per_day).sqrt();
-        let excess_return = mean_return - self.risk_free_rate / (TRADING_DAYS_PER_YEAR * snapshots_per_day);
+        let excess_return =
+            mean_return - self.risk_free_rate / (TRADING_DAYS_PER_YEAR * snapshots_per_day);
         Some(excess_return / std_dev * annualization_factor)
     }
 
@@ -188,7 +203,8 @@ impl SessionTracker {
             return None;
         }
 
-        let returns: Vec<f64> = self.equity_curve
+        let returns: Vec<f64> = self
+            .equity_curve
             .iter()
             .zip(self.equity_curve.iter().skip(1))
             .map(|(prev, curr)| {
@@ -205,18 +221,17 @@ impl SessionTracker {
         }
 
         let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
-        let downside_returns: Vec<f64> = returns.iter()
-            .filter(|r| **r < 0.0)
-            .cloned()
-            .collect();
+        let downside_returns: Vec<f64> = returns.iter().filter(|r| **r < 0.0).cloned().collect();
 
         if downside_returns.is_empty() {
             return Some(f64::INFINITY);
         }
 
-        let downside_variance = downside_returns.iter()
+        let downside_variance = downside_returns
+            .iter()
             .map(|r| (r - mean_return).powi(2))
-            .sum::<f64>() / downside_returns.len() as f64;
+            .sum::<f64>()
+            / downside_returns.len() as f64;
         let downside_dev = downside_variance.sqrt();
 
         if downside_dev == 0.0 {
@@ -225,7 +240,8 @@ impl SessionTracker {
 
         let snapshots_per_day = self.ticks_per_day_estimate / self.equity_snapshot_interval as f64;
         let annualization_factor = (TRADING_DAYS_PER_YEAR * snapshots_per_day).sqrt();
-        let excess_return = mean_return - self.risk_free_rate / (TRADING_DAYS_PER_YEAR * snapshots_per_day);
+        let excess_return =
+            mean_return - self.risk_free_rate / (TRADING_DAYS_PER_YEAR * snapshots_per_day);
         Some(excess_return / downside_dev * annualization_factor)
     }
 
@@ -238,40 +254,101 @@ impl SessionTracker {
     }
 
     pub fn avg_win(&self) -> f64 {
-        let wins: Vec<f64> = self.trades.iter()
+        let wins: Vec<f64> = self
+            .trades
+            .iter()
             .filter(|t| t.net_pnl > 0.0)
             .map(|t| t.net_pnl)
             .collect();
-        if wins.is_empty() { 0.0 } else { wins.iter().sum::<f64>() / wins.len() as f64 }
+        if wins.is_empty() {
+            0.0
+        } else {
+            wins.iter().sum::<f64>() / wins.len() as f64
+        }
     }
 
     pub fn avg_loss(&self) -> f64 {
-        let losses: Vec<f64> = self.trades.iter()
+        let losses: Vec<f64> = self
+            .trades
+            .iter()
             .filter(|t| t.net_pnl < 0.0)
             .map(|t| t.net_pnl)
             .collect();
-        if losses.is_empty() { 0.0 } else { losses.iter().sum::<f64>() / losses.len() as f64 }
+        if losses.is_empty() {
+            0.0
+        } else {
+            losses.iter().sum::<f64>() / losses.len() as f64
+        }
     }
 
     pub fn profit_factor(&self) -> f64 {
-        let gross_profit: f64 = self.trades.iter()
+        let gross_profit: f64 = self
+            .trades
+            .iter()
             .filter(|t| t.net_pnl > 0.0)
             .map(|t| t.net_pnl)
             .sum();
-        let gross_loss: f64 = self.trades.iter()
+        let gross_loss: f64 = self
+            .trades
+            .iter()
             .filter(|t| t.net_pnl < 0.0)
             .map(|t| t.net_pnl.abs())
             .sum();
-        if gross_loss == 0.0 { f64::INFINITY } else { gross_profit / gross_loss }
+        if gross_loss == 0.0 {
+            f64::INFINITY
+        } else {
+            gross_profit / gross_loss
+        }
+    }
+
+    pub fn summary_text(&self) -> String {
+        let sharpe = self
+            .calculate_sharpe_ratio()
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "n/a".to_string());
+        let sortino = self
+            .calculate_sortino_ratio()
+            .map(|v| {
+                if v.is_infinite() {
+                    "INF".to_string()
+                } else {
+                    format!("{:.2}", v)
+                }
+            })
+            .unwrap_or_else(|| "n/a".to_string());
+        format!(
+            "entered={} closed={} win_rate={:.2}% pf={:.2} gross={:.5} fees={:.5} slip={:.5} net={:.5} dd={:.2}% sharpe={} sortino={}",
+            self.trades_entered,
+            self.trades_closed,
+            self.win_rate() * PERCENTAGE_MULTIPLIER,
+            self.profit_factor(),
+            self.total_gross_pnl,
+            self.total_fees,
+            self.total_slippage,
+            self.total_net_pnl,
+            self.max_drawdown * PERCENTAGE_MULTIPLIER,
+            sharpe,
+            sortino,
+        )
     }
 
     pub fn print_summary(&self) {
+        // Structured logging path (file/JSON appenders) + human CLI wrapper.
+        tracing::info!(target: "session", summary = %self.summary_text(),
+            entered = self.trades_entered, closed = self.trades_closed,
+            win_rate = self.win_rate(), profit_factor = self.profit_factor(),
+            gross = self.total_gross_pnl, fees = self.total_fees,
+            slippage = self.total_slippage, net = self.total_net_pnl,
+            max_drawdown = self.max_drawdown, "session summary");
         println!("\n=== SESSION TRADING SUMMARY ===");
         println!("Trades Entered:      {}", self.trades_entered);
         println!("Trades Closed:       {}", self.trades_closed);
         println!("Winning Trades:      {}", self.winning_trades);
         println!("Losing Trades:       {}", self.losing_trades);
-        println!("Win Rate:            {:.2}%", self.win_rate() * PERCENTAGE_MULTIPLIER);
+        println!(
+            "Win Rate:            {:.2}%",
+            self.win_rate() * PERCENTAGE_MULTIPLIER
+        );
         println!("Avg Win:             {:.5} USD", self.avg_win());
         println!("Avg Loss:            {:.5} USD", self.avg_loss());
         println!("Profit Factor:       {:.2}", self.profit_factor());
@@ -279,7 +356,10 @@ impl SessionTracker {
         println!("Total Fees:          {:.5} USD", self.total_fees);
         println!("Total Slippage:      {:.5} USD", self.total_slippage);
         println!("Net PnL:             {:.5} USD", self.total_net_pnl);
-        println!("Max Drawdown:        {:.2}%", self.max_drawdown * PERCENTAGE_MULTIPLIER);
+        println!(
+            "Max Drawdown:        {:.2}%",
+            self.max_drawdown * PERCENTAGE_MULTIPLIER
+        );
 
         if let Some(sharpe) = self.calculate_sharpe_ratio() {
             println!("Sharpe Ratio:        {:.2}", sharpe);
@@ -300,13 +380,22 @@ impl SessionTracker {
         use std::fs::OpenOptions;
         use std::io::{BufWriter, Write};
 
-        let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
         let mut writer = BufWriter::new(file);
         writeln!(writer, "timestamp,equity,drawdown,peak_equity")?;
         for snap in &self.equity_curve {
-            writeln!(writer, "{},{:.5},{:.5},{:.5}",
+            writeln!(
+                writer,
+                "{},{:.5},{:.5},{:.5}",
                 snap.timestamp.format("%Y-%m-%d %H:%M:%S"),
-                snap.equity, snap.drawdown, snap.peak_equity)?;
+                snap.equity,
+                snap.drawdown,
+                snap.peak_equity
+            )?;
         }
         writer.flush()?;
         Ok(())
@@ -316,11 +405,17 @@ impl SessionTracker {
         use std::fs::OpenOptions;
         use std::io::{BufWriter, Write};
 
-        let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
         let mut writer = BufWriter::new(file);
         writeln!(writer, "symbol,entry_time,side,entry_price,exit_price,exit_reason,gross_pnl,fees,slippage,net_pnl,size,contract_size")?;
         for trade in &self.trades {
-            writeln!(writer, "{},{},{},{:.5},{:.5},{},{:.5},{:.5},{:.5},{:.5},{},{}",
+            writeln!(
+                writer,
+                "{},{},{},{:.5},{:.5},{},{:.5},{:.5},{:.5},{:.5},{},{}",
                 trade.symbol,
                 trade.entry_time,
                 trade.side,
@@ -332,9 +427,66 @@ impl SessionTracker {
                 trade.slippage,
                 trade.net_pnl,
                 trade.size,
-                trade.contract_size)?;
+                trade.contract_size
+            )?;
         }
         writer.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(net: f64) -> TradeRecord {
+        TradeRecord {
+            symbol: "BTCUSD".into(),
+            entry_time: 1,
+            side: "buy".into(),
+            entry_price: 100.0,
+            exit_price: 101.0,
+            exit_reason: "TAKE-PROFIT".into(),
+            gross_pnl: net + 1.0,
+            fees: 0.5,
+            slippage: 0.5,
+            net_pnl: net,
+            size: 1,
+            contract_size: 0.001,
+        }
+    }
+
+    #[test]
+    fn tick_counter_gates_snapshots() {
+        let mut t = SessionTracker::new(true, 0.0, 10, 10_000.0, 50_000.0);
+        assert_eq!(t.tick_counter, 0);
+        t.tick();
+        assert_eq!(t.tick_counter, 1);
+        assert!(t.equity_curve.is_empty());
+        for _ in 0..9 {
+            t.tick();
+        }
+        assert_eq!(t.tick_counter, 10);
+        assert_eq!(t.equity_curve.len(), 1);
+    }
+
+    #[test]
+    fn record_trade_counts_and_pf() {
+        let mut t = SessionTracker::new(true, 0.0, 1_000_000, 10_000.0, 50_000.0);
+        t.record_trade(rec(10.0));
+        t.record_trade(rec(-4.0));
+        assert_eq!(t.trades_closed, 2);
+        assert!((t.win_rate() - 0.5).abs() < 1e-9);
+        assert!((t.profit_factor() - 2.5).abs() < 1e-9);
+        // record_trade bumps counter so snapshots stay gated, not spammed
+        assert_eq!(t.tick_counter, 2);
+    }
+
+    #[test]
+    fn profit_factor_no_loss_is_inf() {
+        let mut t = SessionTracker::new(true, 0.0, 1_000_000, 10_000.0, 50_000.0);
+        t.record_trade(rec(5.0));
+        assert!(t.profit_factor().is_infinite());
+        assert_eq!(t.calculate_sharpe_ratio(), None);
     }
 }

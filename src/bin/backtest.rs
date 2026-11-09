@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.session_tracking.risk_free_rate,
         config.session_tracking.equity_snapshot_interval,
         config.session_tracking.initial_equity,
-        100_000.0,
+        config.session_tracking.estimated_ticks_per_day,
     )));
 
     let order_manager = Arc::new(OrderManager::new(
@@ -69,11 +69,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     file.read_to_end(&mut buffer)?;
 
     let record_size = std::mem::size_of::<TickRecord>();
+    if buffer.len() % record_size != 0 {
+        eprintln!(
+            "warning: truncated {} trailing bytes (not a full TickRecord)",
+            buffer.len() % record_size
+        );
+    }
+    if buffer
+        .as_ptr()
+        .align_offset(std::mem::align_of::<TickRecord>())
+        != 0
+    {
+        return Err("TickRecord buffer misaligned; regenerate .bin via convert_data.py".into());
+    }
     let num_records = buffer.len() / record_size;
 
-    let records: &[TickRecord] = unsafe {
-        std::slice::from_raw_parts(buffer.as_ptr() as *const TickRecord, num_records)
-    };
+    let records: &[TickRecord] =
+        unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const TickRecord, num_records) };
 
     let mut count = 0;
     for record in records {
@@ -90,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timestamp_ns: record.ts,
         };
 
-        if let Err(_) = trade_tx.send(EngineMessage::Trade(event)).await {
+        if trade_tx.send(EngineMessage::Trade(event)).await.is_err() {
             break;
         }
         count += 1;
@@ -107,12 +119,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         0.0
     };
-    
+
     let trades_json = serde_json::to_string(&tracker.trades).unwrap_or_else(|_| "[]".to_string());
-    
+
     println!(
         r#"{{"symbol": "{}", "total_ticks": {}, "total_trades": {}, "gross_pnl": {:.4}, "fees": {:.4}, "slippage": {:.4}, "net_pnl": {:.4}, "win_rate": {:.4}, "trades": {}}}"#,
-        symbol, count, tracker.trades_closed, tracker.total_gross_pnl, tracker.total_fees, tracker.total_slippage, net_pnl, win_rate, trades_json
+        symbol,
+        count,
+        tracker.trades_closed,
+        tracker.total_gross_pnl,
+        tracker.total_fees,
+        tracker.total_slippage,
+        net_pnl,
+        win_rate,
+        trades_json
     );
 
     Ok(())

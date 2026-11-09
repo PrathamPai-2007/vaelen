@@ -43,8 +43,8 @@ pub fn generate_signature(
     payload_str: &str,
 ) -> String {
     let signature_data = format!("{}{}{}{}", method, timestamp, path, payload_str);
-    let mut mac = HmacSha256::new_from_slice(api_secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(api_secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(signature_data.as_bytes());
     let result = mac.finalize();
     let code_bytes = result.into_bytes();
@@ -104,9 +104,9 @@ impl OrderManager {
         max_consecutive_failures: u32,
     ) -> Self {
         let client = Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .user_agent("Vaelen/0.1.0 (DeltaTradingEngine)")
             .tcp_keepalive(Duration::from_secs(30))
-            .pool_idle_timeout(None)
+            .pool_idle_timeout(Duration::from_secs(90))
             .timeout(request_timeout)
             .build()
             .unwrap_or_else(|_| Client::new());
@@ -149,7 +149,11 @@ impl OrderManager {
             side: side.to_string(),
             order_type: order_type.to_string(),
             price: price.map(|p| p.to_string()),
-            post_only: if order_type == "limit" { Some("true".to_string()) } else { None },
+            post_only: if order_type == "limit" {
+                Some("true".to_string())
+            } else {
+                None
+            },
             client_order_id,
         };
 
@@ -163,11 +167,13 @@ impl OrderManager {
 
         let method = "POST";
         let path = "/v2/orders";
-        let signature = generate_signature(&self.api_secret, method, &timestamp, path, &payload_str);
+        let signature =
+            generate_signature(&self.api_secret, method, &timestamp, path, &payload_str);
 
         let url = format!("{}{}", self.api_base_url, path);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("api-key", &self.api_key)
             .header("signature", signature)
@@ -182,7 +188,24 @@ impl OrderManager {
 
         if status.is_success() {
             let order_resp: OrderResponse = serde_json::from_str(&body)?;
-            let fill_price = order_resp.avg_fill_price.unwrap_or("0".to_string()).parse().unwrap_or(0.0);
+            let fill_price = order_resp
+                .avg_fill_price
+                .as_deref()
+                .unwrap_or("")
+                .parse::<f64>()
+                .ok()
+                .filter(|p| *p > 0.0 && p.is_finite())
+                .unwrap_or(0.0);
+            if matches!(
+                order_resp.status.as_str(),
+                "filled" | "partial_fill" | "partially_filled"
+            ) && fill_price <= 0.0
+            {
+                return Err(OrderError::ApiError {
+                    status,
+                    body: format!("missing fill price for status {}", order_resp.status),
+                });
+            }
             let fill_info = FillInfo {
                 order_id: order_resp.id,
                 price: fill_price,
@@ -192,6 +215,12 @@ impl OrderManager {
             match order_resp.status.as_str() {
                 "open" | "pending" => Ok(OrderResult::Open(fill_info)),
                 "partial_fill" | "partially_filled" => Ok(OrderResult::Partial(fill_info)),
+                "cancelled" | "rejected" | "expired" | "closed" => {
+                    Ok(OrderResult::Failed(OrderError::ApiError {
+                        status: reqwest::StatusCode::GONE,
+                        body: format!("Order {}", order_resp.status),
+                    }))
+                }
                 _ => Ok(OrderResult::Filled(fill_info)),
             }
         } else {
@@ -220,9 +249,25 @@ impl OrderManager {
         let client_order_id = Some(uuid::Uuid::new_v4().simple().to_string());
 
         loop {
-            match self.place_order(product_id, price, size, side, order_type, client_order_id.clone()).await {
+            match self
+                .place_order(
+                    product_id,
+                    price,
+                    size,
+                    side,
+                    order_type,
+                    client_order_id.clone(),
+                )
+                .await
+            {
                 Ok(result) => {
-                    self.consecutive_failures.store(0, Ordering::SeqCst);
+                    // Only real fills reset the breaker; Open means still pending.
+                    match &result {
+                        OrderResult::Filled(_) | OrderResult::Partial(_) => {
+                            self.consecutive_failures.store(0, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
                     return result;
                 }
                 Err(e) => {
@@ -230,8 +275,9 @@ impl OrderManager {
                     if let OrderError::ApiError { status, body } = &e {
                         if status == &reqwest::StatusCode::BAD_REQUEST {
                             let body_lower = body.to_lowercase();
-                            if (body_lower.contains("duplicate") || body_lower.contains("already exists")) 
-                                && body_lower.contains("client_order_id") 
+                            if (body_lower.contains("duplicate")
+                                || body_lower.contains("already exists"))
+                                && body_lower.contains("client_order_id")
                             {
                                 is_duplicate = true;
                             }
@@ -239,12 +285,21 @@ impl OrderManager {
                     }
 
                     if is_duplicate {
-                        tracing::info!("Duplicate client_order_id detected. Reconciling via GET...");
+                        tracing::info!(
+                            "Duplicate client_order_id detected. Reconciling via GET..."
+                        );
                         if let Some(cid) = &client_order_id {
                             match self.get_order_status_by_client_id(cid).await {
                                 Ok(order_resp) => {
                                     self.consecutive_failures.store(0, Ordering::SeqCst);
-                                    let fill_price = order_resp.avg_fill_price.unwrap_or("0".to_string()).parse().unwrap_or(0.0);
+                                    let fill_price = order_resp
+                                        .avg_fill_price
+                                        .as_deref()
+                                        .unwrap_or("")
+                                        .parse::<f64>()
+                                        .ok()
+                                        .filter(|p| *p > 0.0 && p.is_finite())
+                                        .unwrap_or(0.0);
                                     let fill_info = FillInfo {
                                         order_id: order_resp.id,
                                         price: fill_price,
@@ -253,13 +308,23 @@ impl OrderManager {
                                     };
                                     return match order_resp.status.as_str() {
                                         "open" | "pending" => OrderResult::Open(fill_info),
-                                        "partial_fill" | "partially_filled" => OrderResult::Partial(fill_info),
-                                        "cancelled" | "rejected" => OrderResult::Failed(OrderError::ApiError { status: reqwest::StatusCode::GONE, body: "Order cancelled".to_string() }),
+                                        "partial_fill" | "partially_filled" => {
+                                            OrderResult::Partial(fill_info)
+                                        }
+                                        "cancelled" | "rejected" => {
+                                            OrderResult::Failed(OrderError::ApiError {
+                                                status: reqwest::StatusCode::GONE,
+                                                body: "Order cancelled".to_string(),
+                                            })
+                                        }
                                         _ => OrderResult::Filled(fill_info),
                                     };
                                 }
                                 Err(get_err) => {
-                                    tracing::warn!("Failed to reconcile duplicate client_order_id state: {:?}", get_err);
+                                    tracing::warn!(
+                                        "Failed to reconcile duplicate client_order_id state: {:?}",
+                                        get_err
+                                    );
                                     // Let it fall through to failure increment
                                 }
                             }
@@ -285,8 +350,8 @@ impl OrderManager {
                     }
 
                     let delay = std::cmp::min(
-                        base_delay_secs * 2u64.pow(attempt),
-                        max_delay_secs
+                        base_delay_secs.saturating_mul(2u64.saturating_pow(attempt)),
+                        max_delay_secs,
                     );
 
                     tracing::warn!(
@@ -304,11 +369,7 @@ impl OrderManager {
         }
     }
 
-    pub async fn cancel_order(
-        &self,
-        product_id: u64,
-        order_id: &str,
-    ) -> Result<(), OrderError> {
+    pub async fn cancel_order(&self, product_id: u64, order_id: &str) -> Result<(), OrderError> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         #[derive(serde::Serialize)]
@@ -331,10 +392,12 @@ impl OrderManager {
 
         let method = "DELETE";
         let path = "/v2/orders";
-        let signature = generate_signature(&self.api_secret, method, &timestamp, path, &payload_str);
+        let signature =
+            generate_signature(&self.api_secret, method, &timestamp, path, &payload_str);
         let url = format!("{}{}", self.api_base_url, path);
 
-        let response = self.client
+        let response = self
+            .client
             .delete(&url)
             .header("api-key", &self.api_key)
             .header("signature", signature)
@@ -353,10 +416,7 @@ impl OrderManager {
         }
     }
 
-    pub async fn get_order_status_raw(
-        &self,
-        order_id: &str,
-    ) -> Result<OrderResponse, OrderError> {
+    pub async fn get_order_status_raw(&self, order_id: &str) -> Result<OrderResponse, OrderError> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let timestamp = SystemTime::now()
@@ -368,11 +428,13 @@ impl OrderManager {
         let method = "GET";
         let path = format!("/v2/orders/{}", order_id);
         let payload_str = "";
-        let signature = generate_signature(&self.api_secret, method, &timestamp, &path, payload_str);
+        let signature =
+            generate_signature(&self.api_secret, method, &timestamp, &path, payload_str);
 
         let url = format!("{}{}", self.api_base_url, path);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header("api-key", &self.api_key)
             .header("signature", signature)
@@ -405,11 +467,13 @@ impl OrderManager {
         let method = "GET";
         let path = format!("/v2/orders/client_order_id/{}", client_order_id);
         let payload_str = "";
-        let signature = generate_signature(&self.api_secret, method, &timestamp, &path, payload_str);
+        let signature =
+            generate_signature(&self.api_secret, method, &timestamp, &path, payload_str);
 
         let url = format!("{}{}", self.api_base_url, path);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .header("api-key", &self.api_key)
             .header("signature", signature)
@@ -427,12 +491,16 @@ impl OrderManager {
         }
     }
 
-    pub async fn get_order_status(
-        &self,
-        order_id: &str,
-    ) -> Result<OrderResult, OrderError> {
+    pub async fn get_order_status(&self, order_id: &str) -> Result<OrderResult, OrderError> {
         let order_resp = self.get_order_status_raw(order_id).await?;
-        let fill_price = order_resp.avg_fill_price.unwrap_or("0".to_string()).parse().unwrap_or(0.0);
+        let fill_price = order_resp
+            .avg_fill_price
+            .as_deref()
+            .unwrap_or("")
+            .parse::<f64>()
+            .ok()
+            .filter(|p| *p > 0.0 && p.is_finite())
+            .unwrap_or(0.0);
         let fill_info = FillInfo {
             order_id: order_resp.id,
             price: fill_price,
@@ -442,8 +510,20 @@ impl OrderManager {
         match order_resp.status.as_str() {
             "open" | "pending" => Ok(OrderResult::Open(fill_info)),
             "partial_fill" | "partially_filled" => Ok(OrderResult::Partial(fill_info)),
-            "cancelled" | "rejected" => Err(OrderError::ApiError { status: reqwest::StatusCode::GONE, body: "Order cancelled".to_string() }),
+            "cancelled" | "rejected" => Err(OrderError::ApiError {
+                status: reqwest::StatusCode::GONE,
+                body: "Order cancelled".to_string(),
+            }),
             _ => Ok(OrderResult::Filled(fill_info)),
+        }
+    }
+
+    /// Cancel every open order id in the list for a product. Best-effort.
+    pub async fn cancel_all_for_product(&self, product_id: u64, order_ids: &[String]) {
+        for id in order_ids {
+            if let Err(e) = self.cancel_order(product_id, id).await {
+                tracing::warn!("cancel {} failed during exit/cleanup: {}", id, e);
+            }
         }
     }
 
@@ -465,7 +545,7 @@ impl OrderManager {
             match self.get_order_status(order_id).await {
                 Ok(OrderResult::Filled(fill)) => return Ok(fill),
                 Ok(OrderResult::Partial(fill)) => return Ok(fill),
-                Ok(OrderResult::Open(_)) => {},
+                Ok(OrderResult::Open(_)) => {}
                 Ok(OrderResult::Failed(e)) => return Err(e),
                 Err(e) => {
                     if let OrderError::ApiError { status, .. } = &e {
@@ -497,21 +577,32 @@ mod tests {
         );
 
         // 1st logical failure
-        let r1 = manager.place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[]).await;
+        let r1 = manager
+            .place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[])
+            .await;
         assert!(matches!(r1, OrderResult::Failed(_)));
         assert!(!*manager.circuit_open.read().await);
 
         // 2nd logical failure
-        let r2 = manager.place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[]).await;
+        let _r2 = manager
+            .place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[])
+            .await;
         assert!(!*manager.circuit_open.read().await);
 
         // 3rd logical failure -> trips CB
-        let r3 = manager.place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[]).await;
+        let _r3 = manager
+            .place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[])
+            .await;
         assert!(*manager.circuit_open.read().await);
 
         // 4th attempt -> fails fast
-        let r4 = manager.place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[]).await;
-        assert!(matches!(r4, OrderResult::Failed(OrderError::CircuitBreakerOpen)));
+        let r4 = manager
+            .place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[])
+            .await;
+        assert!(matches!(
+            r4,
+            OrderResult::Failed(OrderError::CircuitBreakerOpen)
+        ));
 
         // manual reset
         manager.reset_circuit_breaker().await;
@@ -520,8 +611,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_order_id_stability() {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -542,15 +633,16 @@ mod tests {
                     let mut buf = [0; 1024];
                     let n = socket.read(&mut buf).await.unwrap_or(0);
                     let req_str = String::from_utf8_lossy(&buf[..n]);
-                    
+
                     if let Some(idx) = req_str.find("\"client_order_id\":\"") {
                         let start = idx + 19;
                         if let Some(end) = req_str[start..].find("\"") {
-                            ids.push(req_str[start..start+end].to_string());
+                            ids.push(req_str[start..start + end].to_string());
                         }
                     }
-                    
-                    let response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+
+                    let response =
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
                     let _ = socket.write_all(response.as_bytes()).await;
                 }
             }
@@ -558,26 +650,30 @@ mod tests {
         });
 
         // 1st logical order: 1 attempt + 2 retries = 3 requests total
-        let _ = manager.place_order_with_retry(1, None, 10, "buy", "market", 2, 0, 0, &[500]).await;
-        
+        let _ = manager
+            .place_order_with_retry(1, None, 10, "buy", "market", 2, 0, 0, &[500])
+            .await;
+
         // 2nd logical order: 1 attempt = 1 request
-        let _ = manager.place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[]).await;
+        let _ = manager
+            .place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[])
+            .await;
 
         let ids = server_handle.await.unwrap();
         assert_eq!(ids.len(), 4, "Expected 4 parsed client_order_ids");
-        
+
         // Retries of order 1 share the same ID
         assert_eq!(ids[0], ids[1]);
         assert_eq!(ids[1], ids[2]);
-        
+
         // Order 2 gets a NEW distinct ID
         assert_ne!(ids[2], ids[3]);
     }
 
     #[tokio::test]
     async fn test_duplicate_client_order_id_recovery() {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -605,7 +701,11 @@ mod tests {
                 let _ = socket.read(&mut buf).await;
                 // 2nd request: retry gets 400 duplicate client_order_id
                 let body = r#"{"error":{"message":"duplicate client_order_id already exists"}}"#;
-                let response = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
                 let _ = socket.write_all(response.as_bytes()).await;
             }
 
@@ -614,14 +714,20 @@ mod tests {
                 let _ = socket.read(&mut buf).await;
                 // 3rd request: GET /v2/orders/client_order_id/...
                 let body = r#"{"id":"order_123","product_id":1,"size":10,"side":"buy","order_type":"market","status":"filled","filled_size":10,"avg_fill_price":"100.5"}"#;
-                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
                 let _ = socket.write_all(response.as_bytes()).await;
             }
         });
 
         // We retry on 500, but not on 400
-        let result = manager.place_order_with_retry(1, None, 10, "buy", "market", 2, 0, 0, &[500]).await;
-        
+        let result = manager
+            .place_order_with_retry(1, None, 10, "buy", "market", 2, 0, 0, &[500])
+            .await;
+
         let _ = server_handle.await;
 
         match result {
@@ -632,7 +738,7 @@ mod tests {
             }
             _ => panic!("Expected Filled result"),
         }
-        
+
         // Circuit breaker should NOT be open because it successfully reconciled.
         assert!(!*manager.circuit_open.read().await);
         assert_eq!(manager.consecutive_failures.load(Ordering::SeqCst), 0);
@@ -640,8 +746,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_genuine_400_error_trips_cb() {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -661,22 +767,31 @@ mod tests {
                 let _ = socket.read(&mut buf).await;
                 // Genuine 400 error not related to duplicate
                 let body = r#"{"error":{"message":"invalid product id"}}"#;
-                let response = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
                 let _ = socket.write_all(response.as_bytes()).await;
             }
         });
 
-        let result = manager.place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[]).await;
+        let result = manager
+            .place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[])
+            .await;
         let _ = server_handle.await;
 
-        assert!(matches!(result, OrderResult::Failed(OrderError::ApiError{..})));
+        assert!(matches!(
+            result,
+            OrderResult::Failed(OrderError::ApiError { .. })
+        ));
         assert!(*manager.circuit_open.read().await);
     }
 
     #[tokio::test]
     async fn test_duplicate_recovery_get_fails_degrades_gracefully() {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -696,7 +811,11 @@ mod tests {
                 let _ = socket.read(&mut buf).await;
                 // 1st request: duplicate client_order_id
                 let body = r#"{"error":{"message":"duplicate client_order_id"}}"#;
-                let response = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
                 let _ = socket.write_all(response.as_bytes()).await;
             }
 
@@ -710,7 +829,9 @@ mod tests {
             }
         });
 
-        let result = manager.place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[]).await;
+        let result = manager
+            .place_order_with_retry(1, None, 10, "buy", "market", 0, 0, 0, &[])
+            .await;
         let _ = server_handle.await;
 
         // Should return the original OrderError or the GET error

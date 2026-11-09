@@ -14,8 +14,8 @@ fn generate_signature(
     payload_str: &str,
 ) -> String {
     let signature_data = format!("{}{}{}{}", method, timestamp, path, payload_str);
-    let mut mac = HmacSha256::new_from_slice(api_secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(api_secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(signature_data.as_bytes());
     let result = mac.finalize();
     let code_bytes = result.into_bytes();
@@ -31,7 +31,8 @@ async fn main() {
     println!("==================================================================");
 
     let api_key = std::env::var("DELTA_API_KEY").unwrap_or_else(|_| "TEST_API_KEY".to_string());
-    let api_secret = std::env::var("DELTA_API_SECRET").unwrap_or_else(|_| "TEST_API_SECRET".to_string());
+    let api_secret =
+        std::env::var("DELTA_API_SECRET").unwrap_or_else(|_| "TEST_API_SECRET".to_string());
     let api_host = "https://api.india.delta.exchange";
 
     let client = Client::builder()
@@ -42,7 +43,12 @@ async fn main() {
     // 1. Live Price Ticker Ingestion Test
     println!("\n[TEST 1/4] Fetching Live Ticker Prices from Delta Exchange REST API...");
     let ticker_url = format!("{}/v2/tickers", api_host);
-    match client.get(&ticker_url).header("api-key", &api_key).send().await {
+    match client
+        .get(&ticker_url)
+        .header("api-key", &api_key)
+        .send()
+        .await
+    {
         Ok(resp) => {
             println!(" - Live Tickers REST Endpoint Status: {}", resp.status());
             if resp.status().is_success() {
@@ -54,11 +60,19 @@ async fn main() {
 
     // 2. Authentication & HMAC-SHA256 Signature Test
     println!("\n[TEST 2/4] Testing HMAC-SHA256 REST Authentication Signature Generation...");
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
     let path = "/v2/wallet/balances";
     let signature = generate_signature(&api_secret, "GET", &timestamp, path, "");
     println!(" - Generated 64-char Hex Signature: {}", signature);
-    assert_eq!(signature.len(), 64, "Signature must be 64 hexadecimal characters");
+    assert_eq!(
+        signature.len(),
+        64,
+        "Signature must be 64 hexadecimal characters"
+    );
     println!("   SUCCESS: HMAC signature generation validated!");
 
     // 3. Limit Order Construction & Paper Order Dispatch Test
