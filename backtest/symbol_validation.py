@@ -59,9 +59,31 @@ def validate_symbols(symbols_to_check, api_host=DELTA_INDIA_API):
 def validate_symbol_config(symbol_config, target_symbol=None, sample_price=None):
     """
     Validation assertion helper for symbol configuration parameters.
+    Checks tick grid, notional sanity ($5-$50k per order), and live-universe guard.
     """
     if not symbol_config:
         raise ValueError("symbol_config cannot be empty")
+    live = {"BTCUSD", "ETHUSD"}
+    sym = (symbol_config.get('symbol') or target_symbol or "").upper()
+    if sym not in live:
+        raise ValueError(f"{sym}: live universe is BTCUSD/ETHUSD only (no memecoins)")
+    tick = float(symbol_config.get('tick_size', 0))
+    contract = float(symbol_config.get('contract_size', 0))
+    if not (tick > 0 and contract > 0):
+        raise ValueError(f"{sym}: tick_size/contract_size must be positive")
+    if symbol_config.get('product_id', 0) in (None, 0):
+        raise ValueError(f"{sym}: product_id must be > 0")
+    if sample_price:
+        per_contract = float(sample_price) * contract
+        target = float(symbol_config.get('target_notional_usd', 2000.0))
+        contracts = max(1, int(target // per_contract)) if per_contract > 0 else 1
+        notional = per_contract * contracts
+        if not (5.0 <= notional <= 50_000.0):
+            raise ValueError(f"{sym}: order notional ${notional:.2f} outside [$5, $50k]")
+        # sample price should sit on the tick grid within half a tick
+        remainder = float(sample_price) % tick
+        if min(remainder, tick - remainder) > tick / 2 + 1e-12:
+            raise ValueError(f"{sym}: sample price off tick grid")
     return True
 
 if __name__ == "__main__":

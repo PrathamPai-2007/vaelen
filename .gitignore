@@ -17,8 +17,12 @@ venv/
 
 # Environment / Logs
 .env
+.env.*
 logs/
 *.log
+config.live.toml
+config.toml.bak
+*.orig
 
 # OS
 .DS_Store

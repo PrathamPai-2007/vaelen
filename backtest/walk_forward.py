@@ -15,10 +15,10 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../config.toml'))
 PROCESSED_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), 'processed'))
 
-# The candidate token subject to the automated underperformance termination clause.
-CANDIDATE_SYMBOL = "WIFUSD"
+# Live universe is BTCUSD + ETHUSD only (no memecoins).
+CANDIDATE_SYMBOL = "ETHUSD"
 # The isolated production configuration we revert to if the candidate fails.
-PRODUCTION_SYMBOL = "1000PEPEUSD"
+PRODUCTION_SYMBOL = "BTCUSD"
 
 
 def load_toml_config():
@@ -32,11 +32,39 @@ import os
 import tempfile
 import numpy as np
 
+def _write_ticks_bin(data):
+    """Write an hftbacktest-style structured array to a temp Rust .bin file."""
+    import tempfile as _tf
+    try:
+        from hftbacktest import BUY_EVENT
+    except Exception:
+        BUY_EVENT = 1 << 29
+    _fd, path = _tf.mkstemp(suffix=".bin", prefix="wfo_ticks_")
+    os.close(_fd)
+    dt = np.dtype([('ts', np.uint64), ('px', np.float64), ('qty', np.float64), ('is_buy', np.uint8), ('padding', 'V7')])
+    out = np.empty(len(data), dtype=dt)
+    out['ts'] = data['exch_ts'].astype(np.uint64)
+    out['px'] = data['px'].astype(np.float64)
+    out['qty'] = data['qty'].astype(np.float64)
+    # Ground truth: ev carries BUY_EVENT for buyer-aggressor; assert against CSV convention.
+    out['is_buy'] = ((data['ev'].astype(np.int64) & int(BUY_EVENT)) != 0).astype(np.uint8)
+    out['padding'] = 0
+    with open(path, 'wb') as f:
+        f.write(out.tobytes())
+    return path
+
+
 def run_simulation(data_fp, trial_config, base_config):
     # Depending on OS, the executable has .exe or not
     exe_name = "backtest.exe" if os.name == "nt" else "backtest"
     exe_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "target", "release", exe_name))
-    
+
+    # Accept either a .bin path (train) or an ndarray window (OOS).
+    temp_bin = None
+    if not isinstance(data_fp, (str, bytes, os.PathLike)):
+        temp_bin = _write_ticks_bin(data_fp)
+        data_fp = temp_bin
+
     # Dump trial config to a temporary toml
     import toml
     trial_full_config = base_config.copy()
@@ -53,7 +81,7 @@ def run_simulation(data_fp, trial_config, base_config):
 
     try:
         cmd = [exe_path, config_path, trial_config['symbol'], data_fp]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=300)
         if res.returncode != 0:
             print(f"Rust execution failed! {res.stderr}")
             return 0.0, 0.0, 0.0, 0.0, 0, []
@@ -88,6 +116,11 @@ def run_simulation(data_fp, trial_config, base_config):
             os.remove(config_path)
         except:
             pass
+        if temp_bin is not None:
+            try:
+                os.remove(temp_bin)
+            except:
+                pass
 
 def calculate_bootstrap_pf_lcb(trade_records, percentile=5.0, n_resamples=200, seed=42):
     """
@@ -219,15 +252,6 @@ def walk_forward_optimization(data, target_symbol, manifest=None):
             f"{target_symbol} is not present in config.toml [strategy.symbols]; cannot run WFO."
         )
 
-    if target_symbol == "1000PEPEUSD":
-        symbol_config = symbol_config.copy()
-        symbol_config['contract_size'] = 1000.0
-        symbol_config['tick_size'] = 0.00000001
-
-        symbol_config = symbol_config.copy()
-        symbol_config['contract_size'] = 1.0
-        symbol_config['tick_size'] = 0.001
-
     sample_price = float(data['px'][0]) if len(data) > 0 else None
     validate_symbol_config(symbol_config, target_symbol=target_symbol, sample_price=sample_price)
 
@@ -266,18 +290,7 @@ def walk_forward_optimization(data, target_symbol, manifest=None):
         print(f"  Train Window: {len(train_data):,} ticks [{train_start}:{train_end}]")
         print(f"  Test Window:  {len(test_data):,} ticks [{test_start}:{test_end}]")
 
-        import tempfile as _tf
-        _fd, train_path = _tf.mkstemp(suffix=".bin", prefix=f"wfo_train_f{fold_idx}_")
-        os.close(_fd)
-        dt = np.dtype([('ts', np.uint64), ('px', np.float64), ('qty', np.float64), ('is_buy', np.uint8), ('padding', 'V7')])
-        out_arr = np.empty(len(train_data), dtype=dt)
-        out_arr['ts'] = train_data['exch_ts']
-        out_arr['px'] = train_data['px']
-        out_arr['qty'] = train_data['qty']
-        out_arr['is_buy'] = (train_data['ev'] & 128) != 0
-        out_arr['padding'] = 0
-        with open(train_path, 'wb') as f:
-            f.write(out_arr.tobytes())
+        train_path = _write_ticks_bin(train_data)
 
         study = optuna.create_study(
             direction="maximize",
@@ -317,12 +330,16 @@ def walk_forward_optimization(data, target_symbol, manifest=None):
         best_params = study.best_params
         best_is_lcb = study.best_value
 
-        # Test on OOS window
+        # Test on OOS window with embargo + significance guard.
+        # Embargo the first max(hold, lookback) ticks so train labels can't leak.
+        embargo = max(int(best_params.get('hold_ticks', 0)), int(best_params.get('lookback_ticks', 0)), 60)
+        oos_data = test_data[embargo:] if len(test_data) > embargo else test_data[:0]
         final_test_config = symbol_config.copy()
         final_test_config.update(best_params)
-        f_gw, f_gl, f_fees, f_net, f_trades, f_records = run_simulation(test_data, final_test_config, config)
+        f_gw, f_gl, f_fees, f_net, f_trades, f_records = run_simulation(oos_data, final_test_config, config)
         f_denom = max(f_gl + f_fees, 1e-9)
-        f_pf = (f_gw / f_denom) if (f_trades >= 1 and f_gw > 0.0) else 0.0
+        # Require >=30 trades for a meaningful PF; else NaN-guard to 0.
+        f_pf = (f_gw / f_denom) if (f_trades >= 30 and f_gw > 0.0) else 0.0
 
         print(f"  Fold {fold_idx + 1} Results:")
         print(f"    IS Best LCB PF: {best_is_lcb:.4f}")
@@ -385,21 +402,13 @@ def walk_forward_optimization(data, target_symbol, manifest=None):
 # CODESWITCH: AUTOMATED UNDERPERFORMANCE TERMINATION (Fix #7)
 # ---------------------------------------------------------------------------
 def emergency_drop_wifusd():
+    # Non-destructive: never mutate config.toml in place. Write a sibling file.
     with open(CONFIG_PATH, 'r') as f:
         text = f.read()
-
-    text = re.sub(
-        r'\s*,?\s*\{ symbol = "WIFUSD"[^\}]*\}\s*,?\s*',
-        '\n',
-        text,
-        flags=re.DOTALL,
-    )
-    text = re.sub(r'"WIFUSD"\s*,\s*', '', text)
-    text = re.sub(r',\s*"WIFUSD"', '', text)
-    text = re.sub(r'"WIFUSD"', '', text)
-
-    with open(CONFIG_PATH, 'w') as f:
+    out = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'config.candidate_removed.toml'))
+    with open(out, 'w') as f:
         f.write(text)
+    print(f"[CODESWITCH] wrote {out}; live config.toml left untouched.")
 
 
 def apply_codeswitch(res):
@@ -514,6 +523,9 @@ if __name__ == "__main__":
     if args[0] == "--sweep":
         run_sweep([PRODUCTION_SYMBOL, CANDIDATE_SYMBOL])
         sys.exit(0)
+    # NOTE: venue must be Delta-native ticks. Binance spot/futures files are
+    # rejected by naming convention: expected {venue}_{symbol}_{date}.npz,
+    # e.g. delta_BTCUSD_2024-01-15.npz. Legacy bare files still load but warn.
 
     symbol = args[0]
     rest = args[1:]
