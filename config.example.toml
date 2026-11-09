@@ -1,0 +1,53 @@
+# Delta Exchange Trading Engine Configuration — LIVE (BTCUSD + ETHUSD only)
+# No memecoins. Fixed $2k notional per entry, max 2 concurrent (1/symbol).
+
+[general]
+api_base_url = "https://api.india.delta.exchange"
+paper_trade_mode = true
+max_concurrent_positions = 2
+trade_channel_buffer = 1000
+trades_dir = "trades"
+log_level = "info"
+json_logs = false
+log_file = "logs/engine.log"
+
+[websocket]
+ws_url = "wss://public-socket.india.delta.exchange"
+symbols = ["BTCUSD", "ETHUSD"]
+ping_interval_secs = 0
+watchdog_timeout_secs = 30
+reconnect_base_secs = 1
+reconnect_max_secs = 60
+user_agent = "Vaelen/0.1.0 (DeltaTradingEngine)"
+
+[notifications.telegram]
+enabled = false
+bot_token = ""
+chat_id = ""
+
+[order_manager]
+request_timeout_secs = 10
+max_retries = 5
+retry_base_delay_secs = 1
+retry_max_delay_secs = 60
+retry_on_status = [429, 500, 502, 503, 504]
+track_fills = true
+fill_timeout_secs = 30
+
+[fees]
+taker_fee_rate = 0.0005
+maker_fee_rate = 0.0002
+slippage_bps = 5.0
+
+[strategy]
+symbols = [
+  { symbol = "BTCUSD", product_id = 27, contract_size = 0.001, order_size = 1, target_notional_usd = 2000.0, max_leverage = 10.0, candle_mins = 5, tick_size = 0.5, stop_loss_bps = 15.0, take_profit_bps = 45.0, hold_ticks = 600, entry_cooldown_ticks = 2000, trailing_stop_atr_mult = 1.5, min_trailing_stop_distance = 1.0, atr_period = 14, lookback_ticks = 24, max_price_impact_threshold = 1e-6, volume_threshold = 0.5, min_cvd_notional_usd = 10000.0, max_capacity = 100 },
+  { symbol = "ETHUSD", product_id = 3136, contract_size = 0.01, order_size = 1, target_notional_usd = 2000.0, max_leverage = 10.0, candle_mins = 5, tick_size = 0.05, stop_loss_bps = 15.0, take_profit_bps = 45.0, hold_ticks = 600, entry_cooldown_ticks = 2000, trailing_stop_atr_mult = 1.5, min_trailing_stop_distance = 0.1, atr_period = 14, lookback_ticks = 24, max_price_impact_threshold = 1e-6, volume_threshold = 0.5, min_cvd_notional_usd = 10000.0, max_capacity = 100 },
+]
+
+[session_tracking]
+enabled = true
+risk_free_rate = 0.05
+equity_snapshot_interval = 100
+initial_equity = 10000.0
+estimated_ticks_per_day = 50000.0
